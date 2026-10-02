@@ -76,9 +76,37 @@ npm install github:juntjtang18/syncbridge
 }
 ```
 
-2. Create the server with a persistent directory. Call `init(subject, applyChange)` once for each subject. `applyChange` writes that subject's business data. The host then listens and binds `syncServer.handle(req, res)` to a path it chooses. The sample path below is `/sync`.
+2. Create the server with a persistent directory. The host listens and binds `syncServer.handle(req, res)` to a path it chooses. The sample path below is `/sync`. Create the client with its own persistent directory and the full endpoint URL, including that path: `createSyncClient({ dataDir, url })`. An optional `headers` function can add the host session to each request.
 
-3. Create the client with its own persistent directory and the full endpoint URL, including that path: `createSyncClient({ dataDir, url })`. Call `init(subject, applyChange)` with the same subject string. An optional `headers` function can add the host session to each request.
+3. Implement the `applyChange` callback. SyncBridge does not write business data. You write this function, and you pass it to `init`. The server and the client each get their own function.
+
+On the server, pass it to `syncServer.init(subject, applyChange)` once for each subject. SyncBridge calls it when a client change is accepted. Write `entry.package.data` and the attachment bytes into server business storage, then return. Throw if the write fails.
+
+```js
+const syncServer = createSyncServer({ dataDir: serverDir })
+syncServer.init(subject, async (entry, attachments) => {
+  const photo = attachments.get("photo-1")
+  const bytes = await photo.read()
+  // Your code: store entry.package.data and bytes in server business storage.
+  // Throw if that store fails.
+})
+```
+
+On the client, pass it to `client.init(subject, applyChange)` with the same subject string. `sync()` calls it for each server entry after the saved pointer. Write that entry into local business storage, then return. Throw if the write fails: the pointer stays put, and the next `sync()` tries the same entry again.
+
+```js
+const client = createSyncClient({
+  dataDir: clientDir,
+  url: "http://127.0.0.1:3000/sync",
+})
+
+await client.init(subject, async (entry, attachments) => {
+  const photo = attachments.get("photo-1")
+  const bytes = await photo.read()
+  // Your code: store entry.package.data and bytes in local business storage.
+  // Throw if that store fails.
+})
+```
 
 4. `subject` is one opaque string. The application composes and escapes it. SyncBridge stores and compares that string and does not parse tenant or seat meaning.
 
@@ -106,19 +134,38 @@ npm install github:juntjtang18/syncbridge
 
 ## Usage example codes
 
-Host server. The process listens. SyncBridge handles the routed request.
+`applyChange`. You implement this function. SyncBridge calls it and does not write business data. The server passes its function to `syncServer.init`. The client passes its function to `client.init`. Each side writes into its own business storage. `entry` is `{ id, position, package }`. `attachments.get(id).read()` returns that entry's bytes. Throw if a write fails.
+
+```js
+import { mkdir, writeFile } from "node:fs/promises"
+import path from "node:path"
+
+async function applyChange(entry, attachments) {
+  const folder = path.join(businessDir, String(entry.position))
+  await mkdir(folder, { recursive: true })
+  await writeFile(
+    path.join(folder, "data.json"),
+    JSON.stringify(entry.package.data),
+  )
+  for (const manifest of entry.package.attachments) {
+    const file = attachments.get(manifest.id)
+    const bytes = await file.read()
+    await writeFile(path.join(folder, file.name || manifest.id), bytes)
+  }
+}
+
+syncServer.init(subject, applyChange)
+await client.init(subject, applyChange)
+```
+
+Host server. The process listens. SyncBridge handles the routed request. `applyChange` is the function above.
 
 ```js
 import http from "node:http"
 import { createSyncServer } from "syncbridge/node"
 
 const syncServer = createSyncServer({ dataDir: serverDir })
-syncServer.init(subject, async (entry, attachments) => {
-  const photo = attachments.get("photo-1")
-  const bytes = await photo.read()
-  // Write entry.package.data and bytes to business storage.
-  // Throw if either write fails.
-})
+syncServer.init(subject, applyChange)
 
 http.createServer((req, res) => {
   const url = new URL(req.url, "http://localhost")
@@ -142,11 +189,7 @@ const client = createSyncClient({
   },
 })
 
-await client.init(subject, async (entry, attachments) => {
-  const photo = attachments.get("photo-1")
-  const bytes = await photo.read()
-  // Write entry.package.data and bytes to local business storage.
-})
+await client.init(subject, applyChange)
 
 await client.appendChanges({
   data: {
