@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto"
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { sha256, subjectDigest } from "./contracts.js"
 import { hashFile } from "./hash-stream.js"
@@ -12,7 +12,43 @@ export function createNodeClientStorage(dataDir) {
       await mkdir(path.join(directory, "attachments"), { recursive: true })
       await writeIfMissing(path.join(directory, "pointer"), "0")
       await writeIfMissing(path.join(directory, "outbox.jsonl"), "")
+      await writeIfMissing(path.join(directory, "subject"), subject)
       return digest
+    },
+
+    async readCurrent() {
+      try {
+        const text = (await readFile(currentPath(dataDir), "utf8")).trim()
+        return text || null
+      } catch (error) {
+        if (error.code === "ENOENT") return null
+        throw error
+      }
+    },
+
+    async writeCurrent(subject) {
+      await mkdir(dataDir, { recursive: true })
+      await writeAtomic(currentPath(dataDir), subject)
+    },
+
+    async listSubjects() {
+      let names
+      try {
+        names = await readdir(path.join(dataDir, "subjects"))
+      } catch (error) {
+        if (error.code === "ENOENT") return []
+        throw error
+      }
+      const subjects = []
+      for (const name of names) {
+        try {
+          const text = (await readFile(path.join(dataDir, "subjects", name, "subject"), "utf8")).trim()
+          if (text) subjects.push(text)
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error
+        }
+      }
+      return subjects
     },
 
     async readPointer(digest) {
@@ -110,6 +146,10 @@ export function createNodeClientStorage(dataDir) {
       return readFile(blobPath(dataDir, digest, expectedHash))
     },
   }
+}
+
+function currentPath(dataDir) {
+  return path.join(dataDir, "current")
 }
 
 function subjectDirectory(dataDir, digest) {

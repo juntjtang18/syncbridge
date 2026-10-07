@@ -29,7 +29,9 @@ test("init validates inputs and creates subject state without syncing", async (t
   await assert.rejects(() => client.init(subject, null), /applyChange/)
 
   await client.init(subject, async () => {})
-  await assert.rejects(() => client.init(subject, async () => {}), /already initialized/)
+  await client.use(subject, async () => {})
+  assert.equal(await client.current(), subject)
+  assert.deepEqual(await client.subjects(), [subject])
   assert.equal(headersCalled, 0)
 
   const digest = subjectDigest(subject)
@@ -38,6 +40,8 @@ test("init validates inputs and creates subject state without syncing", async (t
   assert.equal(digest.includes(subject), false)
   assert.equal(await readFile(path.join(dirs.client, "subjects", digest, "pointer"), "utf8"), "0")
   assert.equal(await readFile(path.join(dirs.client, "subjects", digest, "outbox.jsonl"), "utf8"), "")
+  assert.equal(await readFile(path.join(dirs.client, "subjects", digest, "subject"), "utf8"), subject)
+  assert.equal(await readFile(path.join(dirs.client, "current"), "utf8"), subject)
   await client.appendChanges({ data: { ok: true } })
   await assert.rejects(() => client.appendChanges({ data: undefined }), /package.data/)
   await assert.rejects(
@@ -181,6 +185,94 @@ test("opening an existing server keeps the log and a server append is not applie
   assert.equal(received.length, 1)
   assert.equal(received[0].position, 1)
   assert.equal(received[0].package.data, "kept")
+})
+
+test("use switches current and keeps the previous subject's pointer and outbox", async (t) => {
+  const dirs = await tempDirs(t)
+  const other = "user.4.google.folder-b"
+  const server = createSyncServer({ dataDir: dirs.server })
+  t.after(() => server.close())
+  const endpoints = await listen(server, t)
+  server.init(subject, async () => {})
+  server.init(other, async () => {})
+
+  const client = createSyncClient({ dataDir: dirs.client, url: endpoints.url })
+  await client.use(subject, async () => {})
+  await client.appendChanges({ data: "queued-on-a" })
+  await client.sync()
+  await client.appendChanges({ data: "still-on-a" })
+  assert.equal(await readFile(path.join(dirs.client, "subjects", subjectDigest(subject), "pointer"), "utf8"), "1")
+
+  await client.use(other, async () => {})
+  assert.equal(await client.current(), other)
+  assert.deepEqual(new Set(await client.subjects()), new Set([subject, other]))
+  assert.equal(await readFile(path.join(dirs.client, "subjects", subjectDigest(other), "pointer"), "utf8"), "0")
+  assert.equal(await readFile(path.join(dirs.client, "subjects", subjectDigest(subject), "pointer"), "utf8"), "1")
+  const outboxA = await readFile(path.join(dirs.client, "subjects", subjectDigest(subject), "outbox.jsonl"), "utf8")
+  assert.match(outboxA, /still-on-a/)
+  assert.equal(await readFile(path.join(dirs.client, "subjects", subjectDigest(other), "outbox.jsonl"), "utf8"), "")
+
+  await client.use(subject, async () => {})
+  assert.equal(await client.current(), subject)
+  assert.equal(await readFile(path.join(dirs.client, "subjects", subjectDigest(subject), "pointer"), "utf8"), "1")
+})
+
+test("a live subject change does not write the old log and reuses a known pointer", async (t) => {
+  const dirs = await tempDirs(t)
+  const liveB = "user.4.google.folder-b"
+  let live = subject
+  const appliedA = []
+  const appliedB = []
+  const server = createSyncServer({
+    dataDir: dirs.server,
+    currentSubject() {
+      return live
+    },
+  })
+  t.after(() => server.close())
+  const endpoints = await listen(server, t)
+  server.init(subject, async () => {})
+  server.init(liveB, async () => {})
+
+  const client = createSyncClient({ dataDir: dirs.client, url: endpoints.url })
+  await client.use(subject, async (entry) => {
+    appliedA.push(entry.package.data)
+  })
+  await client.appendChanges({ data: "on-a" })
+  const first = await client.sync()
+  assert.deepEqual(first, { subject })
+  assert.deepEqual(appliedA, ["on-a"])
+  assert.equal(await readFile(path.join(dirs.client, "subjects", subjectDigest(subject), "pointer"), "utf8"), "1")
+
+  live = liveB
+  const switched = await client.sync()
+  assert.deepEqual(switched, { switched: true, subject: liveB })
+  assert.equal(await client.current(), liveB)
+  assert.equal(await readFile(path.join(dirs.client, "subjects", subjectDigest(liveB), "pointer"), "utf8"), "0")
+  assert.equal(await readFile(path.join(dirs.client, "subjects", subjectDigest(subject), "pointer"), "utf8"), "1")
+  assert.deepEqual(appliedA, ["on-a"])
+  const db = new Database(path.join(dirs.server, "syncbridge.sqlite"), { readonly: true })
+  const rows = db.prepare("SELECT subject, package_json FROM log_entries").all()
+  db.close()
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].subject, subject)
+
+  await client.use(liveB, async (entry) => {
+    appliedB.push(entry.package.data)
+  })
+  await client.appendChanges({ data: "on-b" })
+  const syncedB = await client.sync()
+  assert.deepEqual(syncedB, { subject: liveB })
+  assert.equal(await readFile(path.join(dirs.client, "subjects", subjectDigest(liveB), "pointer"), "utf8"), "1")
+  assert.deepEqual(appliedB, ["on-b"])
+
+  live = subject
+  const back = await client.sync()
+  assert.deepEqual(back, { switched: true, subject })
+  await client.use(subject, async (entry) => {
+    appliedA.push(entry.package.data)
+  })
+  assert.equal(await readFile(path.join(dirs.client, "subjects", subjectDigest(subject), "pointer"), "utf8"), "1")
 })
 
 async function tempDirs(t) {

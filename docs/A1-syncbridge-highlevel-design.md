@@ -1,7 +1,8 @@
 # SyncBridge — High-level design
 
-**Status:** 2026-10-02  
-**Requirements:** [A0](./A0-syncbridge-requirements.md)
+**Status:** 2026-10-06  
+**Requirements:** [A0](./A0-syncbridge-requirements.md)  
+**Changing subject:** [A1-1](./A1-1-syncbridge-changing-subject.md)
 
 SyncBridge is middleware for client-server synchronization. It moves opaque change packages. The application decides what a package means and supplies `applyChange` to write that package into its business storage.
 
@@ -52,11 +53,14 @@ The application can compose a readable subject from dot-separated components, es
 "default"
 "tenant." + encode(companyId)
 "tenant." + encode(tenantId) + ".seat." + encode(email)
+"user." + encode(userId) + "." + encode(driver) + "." + encode(root)
 ```
 
-For example, `tenant.company-123.seat.mail%40example%2Ecom` is one subject. The application escapes components so values such as email addresses cannot change the subject shape. SyncBridge stores and compares the final string only.
+For example, `user.4.google.1AbCfolderId` is one subject: that user, that driver, that configured root folder. `tenant.company-123.seat.mail%40example%2Ecom` is another. The application escapes components so values such as email addresses or folder ids cannot change the subject shape. SyncBridge stores and compares the final string only.
 
-A phone can use several subjects. For example, it can synchronize one tenant-wide subject and one seat-private subject. They remain separate logs.
+Each subject has its own server `changelog0`. Positions start at `1` only inside that subject. A pointer is a location in **that** subject's log. Position `3` on folder A is not position `3` on folder B.
+
+A phone can use several subjects. One is **current** (the live root). The others stay on disk so a later return to that root reuses the same log and the same pointer. They remain separate logs.
 
 ## 2. Change log
 
@@ -174,44 +178,86 @@ For Site Inspect, `data` can be the PoI and PoI-entry descriptions; every photo 
 
 ## 4. Client
 
-The platform entry creates a client once:
+The platform entry creates a client once. That client holds **many subjects** and one **current** subject:
 
 ```js
 const client = createSyncClient({ dataDir, send })
-client.init(subject, applyChange)
+await client.use(subject, applyChange)
 ```
 
-`dataDir` is a persistent app directory. The Node entry uses Node file APIs; the Expo entry uses Expo file APIs. SyncBridge owns two client files per subject:
+`dataDir` is a persistent app directory. The Node entry uses Node file APIs; the Expo entry uses Expo file APIs. SyncBridge persists the current subject and, for every subject this device has seen, that subject's pointer, outbox, and attachment cache:
 
 ```text
-<dataDir>/<encoded-subject>.pointer
-<dataDir>/<encoded-subject>.queue.jsonl
+<dataDir>/current
+<dataDir>/subjects/<encoded-subject>/pointer
+<dataDir>/subjects/<encoded-subject>/outbox.jsonl
+<dataDir>/subjects/<encoded-subject>/attachments/<sha256>
 ```
 
-The public client API has three calls:
+That directory set is the persisted list `{ subject, pointer }`. There is no second index. A subject this client has never seen gets `pointer` `0`: every server log entry is new. A subject this client has seen keeps its file. Changing current does not rewrite another subject's pointer.
+
+The public client API is:
 
 ```text
-init(subject, applyChange)
-async sync()
-appendChanges(changeLog)
+use(subject, applyChange)   // create if new, reuse pointer if known, set current
+current() → subject | null
+subjects() → [subject]
+appendChanges(changeLog)    // queues on current (offline ok)
+async sync() → { subject } | { switched: true, subject }
 ```
 
-`appendChanges(changeLog)` adds a local change to the outgoing queue. It does not require a network connection.
+`applyChange` is per subject. Two roots are two local trees. Do not reuse one callback that always writes the same directory.
+
+`appendChanges(changeLog)` adds a local change to the **current** subject's outgoing queue. It does not require a network connection. Unsent work stays in that subject's outbox if current moves away. It flushes only when that subject is current again and `sync()` runs.
 
 `sync()` happens only when the app calls it; SyncBridge does not poll:
 
 ```text
 sync:
-  send subject, saved pointer, and queued changes
+  send current subject, that subject's pointer, and that subject's queued changes
   remove each change the server accepts
+
+  receive the live subject on the response (see §4.1)
+  if the live subject differs from current:
+    persist current + first-seen pointer 0
+    return { switched: true, subject: live } (do not apply the stale body)
 
   receive entries after the saved pointer
   for each entry:
     applyChange(entry)
-    save entry.position as the new pointer
+    save entry.position as the new pointer for this subject
 ```
 
 The pointer is saved only after `applyChange` succeeds. If applying an entry fails, the pointer remains unchanged and the next `sync()` receives that entry again.
+
+### 4.1 Changing the live subject (server folder)
+
+The host application owns the live root (the configured driver folder). SyncBridge does not compose `user.{id}.{driver}.{root}` and does not read the driver spec.
+
+On every `POST /sync` — the call that already names a subject — the **host** puts the live subject on the response:
+
+```js
+{ acceptedIds, entries, attachmentHashes, subject }
+```
+
+`subject` is always the live root, not “the one the client sent.” The extra string is cheap next to attachments. `PUT` and `GET` of raw attachment bytes do not carry a subject.
+
+The client compares. If `response.subject` differs from the subject it sent, that is the folder change. It calls `use(response.subject, applyChange)` and makes that string current. First time this device sees it: pointer `0`. Seen before: reuse that pointer.
+
+If the request subject is not the live subject, the host must **not** append to the old `changelog0`. It rejects (409, or an empty accept list) and still returns the live `subject`. A late sync after a folder change must not mix history into the previous log.
+
+```text
+client POST { subject: A, pointer, changes }
+host live subject is B
+  do not write A's changelog0
+  respond { subject: B, acceptedIds: [], entries: [], … }
+client use(B) → current is B
+next sync() is B (pointer 0 if B is new, else B's saved pointer)
+```
+
+Leave A, go to B, return to A: A’s changelog0 and A’s pointer are reused. Resetting A to `0` on every current change would replay A’s whole history onto a tree that already applied it.
+
+The host supplies the live subject (a `currentSubject(user)` callback, or a wrapper around `handle`). SyncBridge still only opens the log named in the request, and only if the host says that name is current.
 
 ## 5. Server
 
@@ -224,24 +270,25 @@ syncServer.init(subject, applyChange)
 
 SyncServer owns `<dataDir>/syncbridge.sqlite`. It stores `log_entries` indexed by `(subject, position)` and `(subject, id)`, so it can return entries after a pointer without scanning a text file. BizServer does not open the database or implement log storage methods.
 
-When a client sends `{ subject, pointer, changes }`, SyncServer:
+When a client sends `{ subject, pointer, changes }`, and the host says that subject is current, SyncServer:
 
-1. Opens that subject's log.
+1. Opens that subject's log (`changelog0` for that subject only).
 2. Appends each new client change once and assigns its position.
 3. Calls the server `applyChange(entry)` for each accepted client change.
-4. Returns records after `pointer`.
+4. Returns records after `pointer`, plus the live `subject` the host provided.
 
-When BizServer calls `appendChanges(changeLog)`, SyncServer writes that change to `changelog0` but does not apply it again: BizServer already wrote its own business storage.
+When BizServer calls `appendChanges(subject, changeLog)`, SyncServer writes that change to that subject's `changelog0` but does not apply it again: BizServer already wrote its own business storage.
 
-The transport host is responsible for authenticating callers and authorizing which subjects they may use. SyncBridge treats a subject as a log name only.
+The transport host is responsible for authenticating callers, authorizing which subjects they may use, and naming the live subject on every `POST /sync`. SyncBridge treats a subject as a log name only.
 
 ## 6. Library boundary
 
 ```text
-BizClient    applyChange(entry, attachments), appendChanges
-SyncClient   init, sync, appendChanges
+BizClient    applyChange(entry, attachments), appendChanges; asks host for live subject
+SyncClient   use, current, subjects, sync, appendChanges
 SyncServer   init, receive, appendChanges
 BizServer    applyChange(entry, attachments), appendChanges
+Host         live subject on POST /sync; reject a request subject that is not live
 ```
 
 SyncBridge is not built on a normal queue. The client has an outgoing retry queue, but each server subject is a durable replayable log: multiple clients can independently read entries after their own pointers.

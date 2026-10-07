@@ -1,7 +1,8 @@
 # SyncBridge — Requirements
 
-**Status:** 2026-10-02  
-**Design:** [A1](./A1-syncbridge-highlevel-design.md)
+**Status:** 2026-10-06  
+**Design:** [A1](./A1-syncbridge-highlevel-design.md)  
+**Changing subject:** [A1-1](./A1-1-syncbridge-changing-subject.md)
 
 SyncBridge is client-server middleware for synchronizing opaque application changes.
 
@@ -10,9 +11,9 @@ SyncBridge is client-server middleware for synchronizing opaque application chan
 1. A sync system has one server and one or more clients. Two phones and a server are the first case.
 2. Any node can make a change.
 3. A `subject` is one opaque string that names one independent ordered log. Nodes using the same subject see the same log.
-4. SyncBridge does not parse subject semantics. An application may use `"default"`, `"tenant.company-123"`, or `"tenant.company-123.seat.mail%40example%2Ecom"`.
-5. The server stores no pointer for any client. Each client holds its own pointer for each subject.
-6. The transport host authenticates callers and authorizes their use of subjects. SyncBridge treats a subject only as a log name.
+4. SyncBridge does not parse subject semantics. An application may use `"default"`, `"tenant.company-123"`, `"tenant.company-123.seat.mail%40example%2Ecom"`, or `"user.{id}.{driver}.{root}"` when the configured root can change.
+5. The server stores no pointer for any client. Each client persists a pointer (and outbox) for each subject it has seen. A subject this client has never seen starts at pointer `0`. Returning to a known subject reuses that pointer. Changing current does not reset another subject's pointer.
+6. The transport host authenticates callers, authorizes their use of subjects, and names the **live** subject. SyncBridge treats a subject only as a log name. One subject is one `changelog0`.
 
 ## 2. Package and attachments
 
@@ -23,12 +24,14 @@ SyncBridge is client-server middleware for synchronizing opaque application chan
 
 ## 3. Client
 
-11. The platform creates a client with a persistent `dataDir` and a transport `send` function.
-12. The client API is `init(subject, applyChange)`, `sync()`, and `appendChanges(package)`.
-13. SyncBridge owns the client's pointer, outgoing retry queue, and one content-addressed attachment blob cache per subject inside its `dataDir`. Outgoing and received copies of the same SHA-256 share one cache file.
-14. `appendChanges` queues a local change without requiring a network connection.
+11. The platform creates a client with a persistent `dataDir` and a transport `send` function. One client holds many subjects and one current subject.
+12. The client API is `use(subject, applyChange)`, `current()`, `subjects()`, `sync()`, and `appendChanges(package)`. `use` creates the subject if new, reuses its pointer if known, and sets current. `sync` and `appendChanges` apply to current only.
+13. SyncBridge owns, per subject, the client's pointer, outgoing retry queue, and one content-addressed attachment blob cache inside its `dataDir`. It also persists which subject is current. Outgoing and received copies of the same SHA-256 share one cache file.
+14. `appendChanges` queues a local change on the current subject without requiring a network connection. Unsent work stays on that subject's outbox if current moves away.
 15. `sync()` happens only when the application calls it; SyncBridge does not poll.
-16. `sync()` sends queued changes, receives server entries after the local pointer, and advances that pointer only after `applyChange` succeeds.
+16. `sync()` sends the current subject's queued changes, receives server entries after that subject's pointer, and advances that pointer only after `applyChange` succeeds.
+16a. Every `POST /sync` response includes the host's live `subject`. The client compares it to the subject it sent. If they differ, the client `use`s the live subject and does not apply the stale body. Attachment `PUT` / `GET` do not carry a subject.
+16b. If the request subject is not the live subject, the host does not append to that log. It rejects and still returns the live subject.
 
 ## 4. applyChange
 
@@ -41,7 +44,7 @@ SyncBridge is client-server middleware for synchronizing opaque application chan
 
 21. The server creates SyncServer with a persistent `dataDir`; SyncServer owns the ordered log, duplicate IDs, attachment storage, and replay.
 22. SyncServer persists entries in its SQLite file under `dataDir`, indexed by subject and position. It stores attachment bytes separately by subject and SHA-256.
-23. A client sends `{ subject, pointer, changes }`. SyncServer appends each new client change once, calls the server `applyChange` for each accepted client change, and returns entries after `pointer`.
+23. A client sends `{ subject, pointer, changes }`. When that subject is live, SyncServer appends each new client change once, calls the server `applyChange` for each accepted client change, and returns entries after `pointer` plus the live `subject`.
 24. A BizServer local change is appended to the log but is not applied again: BizServer already wrote its own business storage.
 
 ## 6. Reuse

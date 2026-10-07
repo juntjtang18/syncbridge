@@ -8,6 +8,7 @@ import {
 } from "./contracts.js"
 
 export function createClient({ storage, transport }) {
+  const applyBySubject = new Map()
   let subject
   let digest
   let applyChange
@@ -23,15 +24,28 @@ export function createClient({ storage, transport }) {
     if (!subject) throw new Error("client is not initialized")
   }
 
+  async function use(nextSubject, nextApplyChange) {
+    const key = requireSubject(nextSubject)
+    const callback = requireApplyChange(nextApplyChange)
+    const nextDigest = await storage.initSubject(key)
+    applyBySubject.set(key, callback)
+    subject = key
+    digest = nextDigest
+    applyChange = callback
+    await storage.writeCurrent(key)
+  }
+
   return {
-    async init(nextSubject, nextApplyChange) {
-      if (subject) throw new Error("client already initialized")
-      const key = requireSubject(nextSubject)
-      const callback = requireApplyChange(nextApplyChange)
-      const nextDigest = await storage.initSubject(key)
-      subject = key
-      digest = nextDigest
-      applyChange = callback
+    use,
+    init: use,
+
+    async current() {
+      if (subject) return subject
+      return storage.readCurrent()
+    },
+
+    async subjects() {
+      return storage.listSubjects()
     },
 
     appendChanges(input) {
@@ -54,7 +68,19 @@ export function createClient({ storage, transport }) {
           await transport.put(hash, storage.blobFile(digest, hash))
         }
         const response = await transport.post({ subject, pointer, changes })
-        if (!response || !Array.isArray(response.acceptedIds) || !Array.isArray(response.entries) || !Array.isArray(response.attachmentHashes)) {
+        if (!response || typeof response.subject !== "string" || response.subject.length === 0) {
+          throw new TypeError("sync response is invalid")
+        }
+        if (response.subject !== subject) {
+          const live = requireSubject(response.subject)
+          const nextDigest = await storage.initSubject(live)
+          await storage.writeCurrent(live)
+          subject = live
+          digest = nextDigest
+          applyChange = applyBySubject.get(live)
+          return { switched: true, subject: live }
+        }
+        if (!Array.isArray(response.acceptedIds) || !Array.isArray(response.entries) || !Array.isArray(response.attachmentHashes)) {
           throw new TypeError("sync response is invalid")
         }
         await storage.removeOutbox(digest, response.acceptedIds)
@@ -86,6 +112,7 @@ export function createClient({ storage, transport }) {
           ))
           await storage.writePointer(digest, entry.position)
         }
+        return { subject }
       })
     },
   }

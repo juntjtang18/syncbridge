@@ -1,7 +1,8 @@
 # syncbridge
 
 Requirements: [docs/A0-syncbridge-requirements.md](./docs/A0-syncbridge-requirements.md)  
-Design: [docs/A1-syncbridge-highlevel-design.md](./docs/A1-syncbridge-highlevel-design.md)
+Design: [docs/A1-syncbridge-highlevel-design.md](./docs/A1-syncbridge-highlevel-design.md)  
+Changing subject: [docs/A1-1-syncbridge-changing-subject.md](./docs/A1-1-syncbridge-changing-subject.md)
 
 ## Difficulties of a sync system
 
@@ -78,7 +79,7 @@ npm install github:juntjtang18/syncbridge
 
 2. Create the server with a persistent directory. The host listens and binds `syncServer.handle(req, res)` to a path it chooses. The sample path below is `/sync`. Create the client with its own persistent directory and the full endpoint URL, including that path: `createSyncClient({ dataDir, url })`. An optional `headers` function can add the host session to each request.
 
-3. Implement the `applyChange` callback. SyncBridge does not write business data. You write this function, and you pass it to `init`. The server and the client each get their own function.
+3. Implement the `applyChange` callback. SyncBridge does not write business data. You write this function, and you pass it to server `init` and client `use`. The server and the client each get their own function. `applyChange` is per subject.
 
 On the server, pass it to `syncServer.init(subject, applyChange)` once for each subject. SyncBridge calls it when a client change is accepted. Write `entry.package.data` and the attachment bytes into server business storage, then return. Throw if the write fails.
 
@@ -92,7 +93,7 @@ syncServer.init(subject, async (entry, attachments) => {
 })
 ```
 
-On the client, pass it to `client.init(subject, applyChange)` with the same subject string. `sync()` calls it for each server entry after the saved pointer. Write that entry into local business storage, then return. Throw if the write fails: the pointer stays put, and the next `sync()` tries the same entry again.
+On the client, pass it to `client.use(subject, applyChange)`. That call sets **current**. `sync()` and `appendChanges` use current only. A subject this device has never seen starts at pointer `0`. A known subject reuses its pointer. Write each entry into local business storage, then return. Throw if the write fails: the pointer stays put, and the next `sync()` tries the same entry again.
 
 ```js
 const client = createSyncClient({
@@ -100,7 +101,7 @@ const client = createSyncClient({
   url: "http://127.0.0.1:3000/sync",
 })
 
-await client.init(subject, async (entry, attachments) => {
+await client.use(subject, async (entry, attachments) => {
   const photo = attachments.get("photo-1")
   const bytes = await photo.read()
   // Your code: store entry.package.data and bytes in local business storage.
@@ -108,12 +109,13 @@ await client.init(subject, async (entry, attachments) => {
 })
 ```
 
-4. `subject` is one opaque string. The application composes and escapes it. SyncBridge stores and compares that string and does not parse tenant or seat meaning.
+4. `subject` is one opaque string. The application composes and escapes it. SyncBridge stores and compares that string and does not parse tenant, driver, or folder meaning. When the configured root can change, the application includes that root in the string (`user.{id}.{driver}.{root}`). One subject is one server `changelog0`. The client persists every subject it has seen, plus which one is current.
 
 ```js
 "default"
 "tenant.company-123"
 "tenant.company-123.seat.mail%40example%2Ecom"
+"user.4.google.1AbCfolderId"
 ```
 
 5. After the app writes a local business change, call `appendChanges(package)`. This stores the change and its attachment bytes in the client retry queue. A network connection is not required.
@@ -125,7 +127,7 @@ await client.init(subject, async (entry, attachments) => {
 8. On the server, `handle` branches on the method and the parameters. The host path stays `/sync` in this example only because the host bound it there.
 
 - `PUT /sync?sha256=ab12...` streams the body to a temp file and hashes each chunk. A matching hash and size renames the file into the attachment store. A mismatch deletes the temp file.
-- `POST /sync` reads `{ subject, pointer, changes }`, appends each new change to that subject's log, stages any attachment the package names, then calls the host `applyChange(entry, attachments)`. The response is `{ acceptedIds, entries, attachmentHashes }`. The same change id is accepted once.
+- `POST /sync` reads `{ subject, pointer, changes }`. The host names the live subject. If the request subject is not live, the host rejects and still returns `{ subject }`. If it is live, SyncServer appends each new change to that subject's log, stages any attachment the package names, then calls the host `applyChange(entry, attachments)`. The response is `{ acceptedIds, entries, attachmentHashes, subject }`. The client compares `subject` to the one it sent and `use`s the live string if they differ. The same change id is accepted once. Attachment `PUT` / `GET` do not carry a subject.
 - `GET /sync?sha256=ab12...` streams the stored file back.
 
 9. `attachments.get(id).read()` returns the staged bytes for that entry. Throw from `applyChange` if the business write fails. The client pointer stays put, and a failed server apply removes the new log tip so the same change id can be tried again.
@@ -134,7 +136,7 @@ await client.init(subject, async (entry, attachments) => {
 
 ## Usage example codes
 
-`applyChange`. You implement this function. SyncBridge calls it and does not write business data. The server passes its function to `syncServer.init`. The client passes its function to `client.init`. Each side writes into its own business storage. `entry` is `{ id, position, package }`. `attachments.get(id).read()` returns that entry's bytes. Throw if a write fails.
+`applyChange`. You implement this function. SyncBridge calls it and does not write business data. The server passes its function to `syncServer.init`. The client passes its function to `client.use`. Each side writes into its own business storage. `entry` is `{ id, position, package }`. `attachments.get(id).read()` returns that entry's bytes. Throw if a write fails.
 
 ```js
 import { mkdir, writeFile } from "node:fs/promises"
@@ -155,7 +157,7 @@ async function applyChange(entry, attachments) {
 }
 
 syncServer.init(subject, applyChange)
-await client.init(subject, applyChange)
+await client.use(subject, applyChange)
 ```
 
 Host server. The process listens. SyncBridge handles the routed request. `applyChange` is the function above.
@@ -189,7 +191,7 @@ const client = createSyncClient({
   },
 })
 
-await client.init(subject, applyChange)
+await client.use(subject, applyChange)
 
 await client.appendChanges({
   data: {

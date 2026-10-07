@@ -12,7 +12,10 @@ import {
 } from "./contracts.js"
 import { writeHashed } from "./hash-stream.js"
 
-export function createServer({ storage }) {
+export function createServer({ storage, currentSubject }) {
+  if (currentSubject !== undefined && typeof currentSubject !== "function") {
+    throw new TypeError("currentSubject must be a function")
+  }
   const callbacks = new Map()
   let tail = Promise.resolve()
 
@@ -33,7 +36,7 @@ export function createServer({ storage }) {
     handle(req, res) {
       return exclusive(async () => {
         try {
-          await dispatch(req, res, storage, callbacks)
+          await dispatch(req, res, storage, callbacks, currentSubject)
         } catch (error) {
           writeError(res, error)
         }
@@ -58,15 +61,15 @@ export function createServer({ storage }) {
   }
 }
 
-async function dispatch(req, res, storage, callbacks) {
+async function dispatch(req, res, storage, callbacks, currentSubject) {
   const query = new URL(req.url || "/", "http://localhost").searchParams
   if (req.method === "PUT") {
     await handlePut(req, res, storage, query)
     return
   }
   if (req.method === "POST") {
-    const result = await handlePost(req, storage, callbacks)
-    sendJson(res, 200, result)
+    const result = await handlePost(req, storage, callbacks, currentSubject)
+    sendJson(res, result.status, result.body)
     return
   }
   if (req.method === "GET") {
@@ -92,12 +95,21 @@ async function handlePut(req, res, storage, query) {
   res.end()
 }
 
-async function handlePost(req, storage, callbacks) {
+async function handlePost(req, storage, callbacks, currentSubject) {
   const body = await readJson(req)
   if (body === null || typeof body !== "object" || Array.isArray(body)) {
     throw new TypeError("request must be an object")
   }
   const subject = requireSubject(body.subject)
+  const live = currentSubject === undefined
+    ? subject
+    : requireSubject(await currentSubject(req))
+  if (live !== subject) {
+    return {
+      status: 409,
+      body: { subject: live, acceptedIds: [], entries: [], attachmentHashes: [] },
+    }
+  }
   if (!callbacks.has(subject)) throw new Error(`subject is not initialized: ${subject}`)
   const changes = body.changes ?? []
   if (!Array.isArray(changes)) throw new TypeError("changes must be an array")
@@ -115,7 +127,8 @@ async function handlePost(req, storage, callbacks) {
       }
     }
   }
-  return receiveLocked(storage, callbacks, body)
+  const result = await receiveLocked(storage, callbacks, body)
+  return { status: 200, body: { ...result, subject } }
 }
 
 async function handleGet(res, storage, query) {

@@ -17,7 +17,7 @@ export function createSyncClient({ dataDir, url, headers }) {
   })
 }
 
-export function createSyncServer({ dataDir }) {
+export function createSyncServer({ dataDir, currentSubject }) {
   requireDataDir(dataDir)
-  return createServer({ storage: createNodeServerStorage(dataDir) })
+  return createServer({ storage: createNodeServerStorage(dataDir), currentSubject })
 }

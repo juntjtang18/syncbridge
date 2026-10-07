@@ -21,7 +21,7 @@ export function createHttpTransport({ url, headers }) {
 
     async post(body) {
       const payload = Buffer.from(JSON.stringify(body))
-      const text = await send({
+      const { status, text } = await send({
         url,
         method: "POST",
         headers: await requestHeaders(headers, {
@@ -29,8 +29,12 @@ export function createHttpTransport({ url, headers }) {
           "content-length": String(payload.length),
         }),
         body: payload,
+        withStatus: true,
       })
-      return JSON.parse(text)
+      const parsed = text ? JSON.parse(text) : {}
+      if (status === 409 && parsed && typeof parsed.subject === "string") return parsed
+      if (status < 200 || status >= 300) throw errorFrom(Buffer.from(text || ""))
+      return parsed
     },
 
     async get(hash, filePath) {
@@ -58,12 +62,12 @@ async function requestHeaders(headers, extra = {}) {
   return { ...provided, ...extra }
 }
 
-function send({ url, method, headers, body, writeTo }) {
+function send({ url, method, headers, body, writeTo, withStatus }) {
   const target = url instanceof URL ? url : new URL(url)
   const lib = target.protocol === "https:" ? https : http
   return new Promise((resolve, reject) => {
     const req = lib.request(target, { method, headers }, (res) => {
-      if (res.statusCode < 200 || res.statusCode >= 300) {
+      if (!withStatus && (res.statusCode < 200 || res.statusCode >= 300)) {
         const chunks = []
         res.on("data", (chunk) => chunks.push(chunk))
         res.on("end", () => reject(errorFrom(Buffer.concat(chunks))))
@@ -76,7 +80,10 @@ function send({ url, method, headers, body, writeTo }) {
       }
       const chunks = []
       res.on("data", (chunk) => chunks.push(chunk))
-      res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")))
+      res.on("end", () => {
+        const text = Buffer.concat(chunks).toString("utf8")
+        resolve(withStatus ? { status: res.statusCode, text } : text)
+      })
       res.on("error", reject)
     })
     req.on("error", reject)

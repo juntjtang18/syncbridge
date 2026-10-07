@@ -54,6 +54,12 @@ test("handle stages a stream and applies the posted change on any host path", as
     }),
   })
   assert.equal(duplicate.status, 200)
+  assert.deepEqual(await duplicate.json(), {
+    acceptedIds: [appended.id],
+    entries: [],
+    attachmentHashes: [],
+    subject,
+  })
   assert.equal(applies, 1)
 
   const downloaded = await fetch(`${endpoints.also}?sha256=${photoHash}`)
@@ -81,6 +87,47 @@ test("handle stages a stream and applies the posted change on any host path", as
   assert.deepEqual(Buffer.from(await kept.arrayBuffer()), extra)
   const temps = await readdir(path.join(dirs.server, "tmp"))
   assert.deepEqual(temps, [])
+})
+
+test("POST echoes the live subject and refuses a stale one", async (t) => {
+  const dirs = await tempDirs(t)
+  const liveB = "user.4.google.folder-b"
+  let live = subject
+  const server = createSyncServer({
+    dataDir: dirs.server,
+    currentSubject() {
+      return live
+    },
+  })
+  t.after(() => server.close())
+  const endpoints = await listen(server, t)
+  server.init(subject, async () => {})
+
+  const ok = await fetch(endpoints.url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ subject, pointer: 0, changes: [] }),
+  })
+  assert.equal(ok.status, 200)
+  assert.equal((await ok.json()).subject, subject)
+
+  live = liveB
+  const stale = await fetch(endpoints.url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      subject,
+      pointer: 0,
+      changes: [{ id: "change-a", package: { data: "nope", attachments: [] } }],
+    }),
+  })
+  assert.equal(stale.status, 409)
+  assert.deepEqual(await stale.json(), {
+    subject: liveB,
+    acceptedIds: [],
+    entries: [],
+    attachmentHashes: [],
+  })
 })
 
 test("a throwing applyChange rolls the log tip back through the handler", async (t) => {
