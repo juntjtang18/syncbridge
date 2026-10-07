@@ -8,7 +8,6 @@ import {
   requireApplyChange,
   requirePointer,
   requireSubject,
-  sha256,
 } from "./contracts.js"
 import { writeHashed } from "./hash-stream.js"
 
@@ -48,7 +47,6 @@ export function createServer({ storage, currentSubject }) {
         const key = requireSubject(subject)
         if (!callbacks.has(key)) throw new Error(`subject is not initialized: ${key}`)
         const prepared = preparePackage(input)
-        for (const blob of prepared.blobs) storage.putAttachment(key, blob.sha256, blob.bytes)
         const id = randomId()
         const result = storage.appendEntry(key, id, prepared.package)
         return { id, position: result.position }
@@ -64,7 +62,7 @@ export function createServer({ storage, currentSubject }) {
 async function dispatch(req, res, storage, callbacks, currentSubject) {
   const query = new URL(req.url || "/", "http://localhost").searchParams
   if (req.method === "PUT") {
-    await handlePut(req, res, storage, query)
+    await handlePut(req, res, storage)
     return
   }
   if (req.method === "POST") {
@@ -80,19 +78,16 @@ async function dispatch(req, res, storage, callbacks, currentSubject) {
   res.end()
 }
 
-async function handlePut(req, res, storage, query) {
-  const expected = requireSha256(query)
+async function handlePut(req, res, storage) {
   const tempPath = storage.beginBlob()
   try {
     const written = await writeHashed(req, tempPath)
-    if (written.hash !== expected) throw new TypeError("attachment hash mismatch")
-    storage.commitBlob(expected, tempPath, written.size)
+    storage.commitBlob(written.hash, tempPath, written.size)
+    sendJson(res, 200, { sha256: written.hash, size: written.size })
   } catch (error) {
     storage.discardBlob(tempPath)
     throw error
   }
-  res.writeHead(204)
-  res.end()
 }
 
 async function handlePost(req, storage, callbacks, currentSubject) {
@@ -111,22 +106,6 @@ async function handlePost(req, storage, callbacks, currentSubject) {
     }
   }
   if (!callbacks.has(subject)) throw new Error(`subject is not initialized: ${subject}`)
-  const changes = body.changes ?? []
-  if (!Array.isArray(changes)) throw new TypeError("changes must be an array")
-  for (const change of changes) {
-    if (change === null || typeof change !== "object") throw new TypeError("change must be an object")
-    const packageValue = persistedPackage(change.package)
-    for (const manifest of packageValue.attachments) {
-      try {
-        await storage.installAttachment(subject, manifest.sha256, manifest.size)
-      } catch (error) {
-        if (error.message === "attachment verification failed") {
-          throw new Error(`attachment verification failed for ${manifest.id}`)
-        }
-        throw error
-      }
-    }
-  }
   const result = await receiveLocked(storage, callbacks, body)
   return { status: 200, body: { ...result, subject } }
 }
@@ -162,31 +141,40 @@ async function receiveLocked(storage, callbacks, request) {
       throw new TypeError("change.id must be a non-empty string")
     }
     const packageValue = persistedPackage(change.package)
+    const existing = storage.hasEntry(subject, change.id)
+    if (existing) {
+      acceptedIds.push(change.id)
+      continue
+    }
     for (const manifest of packageValue.attachments) {
-      const stored = storage.readAttachment(subject, manifest.sha256)
-      if (sha256(stored) !== manifest.sha256 || stored.length !== manifest.size) {
+      try {
+        storage.requireBlob(manifest.sha256, manifest.size)
+      } catch {
         throw new Error(`attachment verification failed for ${manifest.id}`)
       }
     }
     const result = storage.appendEntry(subject, change.id, packageValue)
-    if (!result.duplicate) {
-      const entry = { id: change.id, position: result.position, package: packageValue }
-      try {
-        await applyChange(entry, readerFor(storage, subject, packageValue.attachments))
-      } catch (error) {
-        storage.removeTip(subject, change.id, result.position)
-        throw error
+    const entry = { id: change.id, position: result.position, package: packageValue }
+    try {
+      const applied = await applyChange(entry, readerFor(storage, packageValue.attachments))
+      if (applied?.attachments) {
+        storage.updateAttachmentPaths(subject, change.id, applied.attachments)
       }
+      for (const manifest of packageValue.attachments) {
+        storage.dropBlob(manifest.sha256)
+      }
+    } catch (error) {
+      storage.removeTip(subject, change.id, result.position)
+      throw error
     }
     acceptedIds.push(change.id)
   }
 
-  const entries = storage.entriesAfter(subject, pointer)
-  const hashes = new Set()
-  for (const entry of entries) {
-    for (const manifest of entry.package.attachments) hashes.add(manifest.sha256)
+  return {
+    acceptedIds,
+    entries: storage.entriesAfter(subject, pointer),
+    attachmentHashes: [],
   }
-  return { acceptedIds, entries, attachmentHashes: [...hashes] }
 }
 
 function requireSha256(query) {
@@ -227,6 +215,6 @@ function writeError(res, error) {
   sendJson(res, status, { error: error.message || "request failed" })
 }
 
-function readerFor(storage, subject, manifests) {
-  return createAttachmentReader(manifests, async (digest) => storage.readAttachment(subject, digest))
+function readerFor(storage, manifests) {
+  return createAttachmentReader(manifests, async (manifest) => storage.readBlob(manifest.sha256))
 }

@@ -1,8 +1,6 @@
 import * as Crypto from "expo-crypto"
 import { fetch } from "expo/fetch"
-import { File } from "expo-file-system"
 
-import { requireApplyChange, requireSubject, preparePackage, createAttachmentReader } from "./contracts.js"
 import { createExpoClientStorage } from "./expo-client-storage.js"
 import { createFetchTransport } from "./fetch-transport.js"
 import { createClient } from "./sync-client.js"
@@ -16,18 +14,13 @@ export function createSyncClient({ dataDir, url, headers }) {
 
   return createClient({
     storage: createExpoClientStorage(dataDir, { sha256, subjectDigest, randomId }),
-    transport: createFetchTransport({
-      url,
-      headers,
-      fetch,
-      openRead: (fileUri) => new File(fileUri).readableStream(),
-      openWrite: (fileUri) => new File(fileUri).writableStream(),
-      size: (fileUri) => new File(fileUri).size,
-    }),
+    transport: createFetchTransport({ url, headers, fetch }),
+    sha256,
+    randomId,
   })
 }
 
-export { createAttachmentReader, preparePackage, requireApplyChange, requireSubject }
+export { createAttachmentReader, preparePackage, requireApplyChange, requireSubject } from "./client-contracts.js"
 
 async function sha256(bytes) {
   const digest = await Crypto.digest(Crypto.CryptoDigestAlgorithm.SHA256, bytes)

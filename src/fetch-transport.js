@@ -1,23 +1,20 @@
-export function createFetchTransport({ url, headers, openRead, openWrite, size, fetch }) {
-  if (typeof openRead !== "function") throw new TypeError("openRead must be a function")
-  if (typeof openWrite !== "function") throw new TypeError("openWrite must be a function")
+export function createFetchTransport({ url, headers, fetch }) {
   const request = fetch ?? globalThis.fetch.bind(globalThis)
 
   return {
-    async put(hash, fileRef) {
+    async put(body) {
       const extra = { "content-type": "application/octet-stream" }
-      if (typeof size === "function") {
-        const length = await size(fileRef)
-        if (length != null) extra["content-length"] = String(length)
-      }
-      const response = await request(withHash(url, hash), {
+      if (body instanceof Uint8Array) extra["content-length"] = String(body.byteLength)
+      const response = await request(url, {
         method: "PUT",
         credentials: "include",
         headers: await requestHeaders(headers, extra),
         duplex: "half",
-        body: await openRead(fileRef),
+        body,
       })
-      await requireText(response)
+      const text = await requireText(response)
+      const parsed = text ? JSON.parse(text) : {}
+      return { sha256: parsed.sha256, size: parsed.size }
     },
 
     async post(body) {
@@ -34,17 +31,21 @@ export function createFetchTransport({ url, headers, openRead, openWrite, size, 
       return JSON.parse(await requireText(response))
     },
 
-    async get(hash, fileRef) {
+    async get(hash, dest) {
       const response = await request(withHash(url, hash), {
         method: "GET",
         credentials: "include",
         headers: await requestHeaders(headers),
       })
       if (!response.ok) throw await errorFrom(response)
-      if (response.body == null || typeof response.body.pipeTo !== "function") {
-        throw new TypeError("fetch response does not expose a readable body stream")
+      if (dest && typeof dest.getWriter === "function") {
+        if (response.body == null || typeof response.body.pipeTo !== "function") {
+          throw new TypeError("fetch response does not expose a readable body stream")
+        }
+        await response.body.pipeTo(dest)
+        return
       }
-      await response.body.pipeTo(await openWrite(fileRef))
+      return new Uint8Array(await response.arrayBuffer())
     },
   }
 }

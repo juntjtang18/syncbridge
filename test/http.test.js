@@ -1,15 +1,15 @@
 import { createHash } from "node:crypto"
-import { createReadStream, createWriteStream } from "node:fs"
-import { mkdtemp, readdir, rm, stat } from "node:fs/promises"
+import { mkdtemp, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { Readable, Writable } from "node:stream"
 import assert from "node:assert/strict"
 import test from "node:test"
+import { randomId, sha256 as digestBytes } from "../src/contracts.js"
 import { createFetchTransport } from "../src/fetch-transport.js"
 import { createNodeClientStorage } from "../src/node-client-storage.js"
 import { createClient } from "../src/sync-client.js"
 import { createSyncClient, createSyncServer } from "../src/node.js"
+import { assertNoClientStaging, assertNoServerStaging, createHostStore } from "../testing/host.js"
 import { listen } from "../testing/listen.js"
 
 const subject = "tenant.company-123"
@@ -18,6 +18,7 @@ test("handle stages a stream and applies the posted change on any host path", as
   const dirs = await tempDirs(t)
   const photo = Buffer.from("photo-bytes")
   const photoHash = sha256(photo)
+  const store = createHostStore([["poi-1.jpg", photo]])
   let applies = 0
   const server = createSyncServer({ dataDir: dirs.server })
   t.after(() => server.close())
@@ -29,13 +30,15 @@ test("handle stages a stream and applies the posted change on any host path", as
   })
 
   const client = createSyncClient({ dataDir: dirs.client, url: endpoints.url })
-  await client.init(subject, async () => {})
+  await client.init(subject, async () => {}, { readAttachment: store.readAttachment })
   const appended = await client.appendChanges({
     data: { poi: "north-wall" },
-    attachments: [{ id: "photo-1", bytes: photo, contentType: "image/jpeg", name: "poi-1.jpg" }],
+    attachments: [{ id: "photo-1", path: "poi-1.jpg", contentType: "image/jpeg" }],
   })
   await client.sync()
   assert.equal(applies, 1)
+  await assertNoServerStaging(dirs.server)
+  await assertNoClientStaging(dirs.client)
 
   const duplicate = await fetch(endpoints.also, {
     method: "POST",
@@ -52,7 +55,7 @@ test("handle stages a stream and applies the posted change on any host path", as
             sha256: photoHash,
             size: photo.length,
             contentType: "image/jpeg",
-            name: "poi-1.jpg",
+            path: "poi-1.jpg",
           }],
         },
       }],
@@ -68,26 +71,26 @@ test("handle stages a stream and applies the posted change on any host path", as
   assert.equal(applies, 1)
 
   const downloaded = await fetch(`${endpoints.also}?sha256=${photoHash}`)
-  assert.equal(downloaded.status, 200)
-  assert.deepEqual(Buffer.from(await downloaded.arrayBuffer()), photo)
+  assert.equal(downloaded.status, 404)
 
   const extra = Buffer.from("from-the-other-path")
   const extraHash = sha256(extra)
-  const uploaded = await fetch(`${endpoints.also}?sha256=${extraHash}`, {
+  const uploaded = await fetch(endpoints.also, {
     method: "PUT",
     headers: { "content-type": "application/octet-stream", "content-length": String(extra.length) },
     body: extra,
   })
-  assert.equal(uploaded.status, 204)
+  assert.equal(uploaded.status, 200)
+  assert.deepEqual(await uploaded.json(), { sha256: extraHash, size: extra.length })
   const fromSync = await fetch(`${endpoints.url}?sha256=${extraHash}`)
   assert.deepEqual(Buffer.from(await fromSync.arrayBuffer()), extra)
 
-  const mismatch = await fetch(`${endpoints.url}?sha256=${extraHash}`, {
+  const second = await fetch(endpoints.url, {
     method: "PUT",
     headers: { "content-type": "application/octet-stream" },
     body: Buffer.from("nope"),
   })
-  assert.equal(mismatch.status, 400)
+  assert.equal(second.status, 200)
   const kept = await fetch(`${endpoints.also}?sha256=${extraHash}`)
   assert.deepEqual(Buffer.from(await kept.arrayBuffer()), extra)
   const temps = await readdir(path.join(dirs.server, "tmp"))
@@ -138,6 +141,7 @@ test("POST echoes the live subject and refuses a stale one", async (t) => {
 test("an Expo-style fetch stream client syncs a changelog and attachment both ways", async (t) => {
   const dirs = await tempDirs(t)
   const photo = Buffer.alloc(256 * 1024, 0x5a)
+  const store = createHostStore([["poi-1.jpg", photo]])
   let serverApplies = 0
   const server = createSyncServer({ dataDir: dirs.server })
   t.after(() => server.close())
@@ -146,16 +150,20 @@ test("an Expo-style fetch stream client syncs a changelog and attachment both wa
     serverApplies += 1
     assert.equal(entry.package.data.poi, "south-wall")
     assert.deepEqual(Buffer.from(await attachments.get("photo-1").read()), photo)
+    store.put("server/poi-1.jpg", photo)
+    return { attachments: [{ id: "photo-1", path: "server/poi-1.jpg" }] }
   })
 
   const sender = createExpoStyleClient({ dataDir: dirs.client, url: endpoints.url })
-  await sender.init(subject, async () => {})
+  await sender.init(subject, async () => {}, { readAttachment: store.readAttachment })
   await sender.appendChanges({
     data: { poi: "south-wall" },
-    attachments: [{ id: "photo-1", bytes: photo, contentType: "image/jpeg", name: "poi-1.jpg" }],
+    attachments: [{ id: "photo-1", path: "poi-1.jpg", contentType: "image/jpeg" }],
   })
   await sender.sync()
   assert.equal(serverApplies, 1)
+  await assertNoServerStaging(dirs.server)
+  await assertNoClientStaging(dirs.client)
 
   const received = []
   const receiver = createExpoStyleClient({ dataDir: path.join(path.dirname(dirs.client), "client-b"), url: endpoints.url })
@@ -164,22 +172,20 @@ test("an Expo-style fetch stream client syncs a changelog and attachment both wa
       data: entry.package.data,
       bytes: await attachments.get("photo-1").read(),
     })
-  })
+  }, { readAttachment: store.readAttachment })
   await receiver.sync()
   assert.equal(received.length, 1)
   assert.equal(received[0].data.poi, "south-wall")
   assert.deepEqual(Buffer.from(received[0].bytes), photo)
+  await assertNoClientStaging(path.join(path.dirname(dirs.client), "client-b"))
 })
 
 function createExpoStyleClient({ dataDir, url }) {
   return createClient({
     storage: createNodeClientStorage(dataDir),
-    transport: createFetchTransport({
-      url,
-      openRead: (filePath) => Readable.toWeb(createReadStream(filePath)),
-      openWrite: (filePath) => Writable.toWeb(createWriteStream(filePath)),
-      size: async (filePath) => (await stat(filePath)).size,
-    }),
+    transport: createFetchTransport({ url }),
+    sha256: digestBytes,
+    randomId,
   })
 }
 

@@ -1,13 +1,10 @@
 import { randomUUID } from "node:crypto"
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import Database from "better-sqlite3"
-import { sha256, subjectDigest } from "./contracts.js"
-import { hashFile } from "./hash-stream.js"
 
 export function createNodeServerStorage(dataDir) {
   mkdirSync(dataDir, { recursive: true })
-  mkdirSync(path.join(dataDir, "attachments"), { recursive: true })
   const db = new Database(path.join(dataDir, "syncbridge.sqlite"))
   db.pragma("journal_mode = WAL")
   db.exec(`
@@ -26,12 +23,14 @@ export function createNodeServerStorage(dataDir) {
   `)
 
   const selectById = db.prepare("SELECT position FROM log_entries WHERE subject = ? AND id = ?")
+  const selectEntry = db.prepare("SELECT package_json FROM log_entries WHERE subject = ? AND id = ?")
   const selectCounter = db.prepare("SELECT next_position FROM subject_counters WHERE subject = ?")
   const insertCounter = db.prepare("INSERT INTO subject_counters (subject, next_position) VALUES (?, ?)")
   const updateCounter = db.prepare("UPDATE subject_counters SET next_position = ? WHERE subject = ?")
   const insertEntry = db.prepare(
     "INSERT INTO log_entries (subject, position, id, package_json) VALUES (?, ?, ?, ?)",
   )
+  const updatePackage = db.prepare("UPDATE log_entries SET package_json = ? WHERE subject = ? AND id = ?")
   const selectAfter = db.prepare(`
     SELECT id, position, package_json
     FROM log_entries
@@ -63,36 +62,13 @@ export function createNodeServerStorage(dataDir) {
     return path.join(dataDir, "blobs", requireHash(expectedHash))
   }
 
-  function subjectFile(subject, expectedHash) {
-    return path.join(dataDir, "attachments", subjectDigest(subject), requireHash(expectedHash))
-  }
-
-  function writeBlob(expectedHash, bytes) {
-    const destination = blobFile(expectedHash)
-    mkdirSync(path.dirname(destination), { recursive: true })
-    if (existsSync(destination)) {
-      if (statSync(destination).size !== bytes.length) throw new Error("attachment cache mismatch")
-      return
-    }
-    const temporary = path.join(dataDir, "tmp", `${randomUUID()}.tmp`)
-    mkdirSync(path.dirname(temporary), { recursive: true })
-    writeFileSync(temporary, bytes)
-    renameSync(temporary, destination)
-  }
-
-  function copyBlobToSubject(subject, expectedHash, size) {
-    const destination = subjectFile(subject, expectedHash)
-    mkdirSync(path.dirname(destination), { recursive: true })
-    if (existsSync(destination)) {
-      if (statSync(destination).size !== size) throw new Error("attachment cache mismatch")
-      return
-    }
-    copyFileSync(blobFile(expectedHash), destination)
-  }
-
   return {
     appendEntry(subject, id, packageValue) {
       return append(subject, id, packageValue)
+    },
+
+    hasEntry(subject, id) {
+      return Boolean(selectById.get(subject, id))
     },
 
     entriesAfter(subject, pointer) {
@@ -103,15 +79,23 @@ export function createNodeServerStorage(dataDir) {
       }))
     },
 
-    removeTip(subject, id, position) {
-      removeTip(subject, id, position)
+    updateAttachmentPaths(subject, id, updates) {
+      if (!Array.isArray(updates) || updates.length === 0) return
+      const row = selectEntry.get(subject, id)
+      if (!row) return
+      const packageValue = JSON.parse(row.package_json)
+      const byId = new Map(updates.map((item) => [item.id, item]))
+      for (const manifest of packageValue.attachments) {
+        const next = byId.get(manifest.id)
+        if (next && typeof next.path === "string" && next.path.length > 0) {
+          manifest.path = next.path
+        }
+      }
+      updatePackage.run(JSON.stringify(packageValue), subject, id)
     },
 
-    putAttachment(subject, expectedHash, bytes) {
-      const actual = sha256(bytes)
-      if (actual !== expectedHash) throw new Error("attachment hash mismatch")
-      writeBlob(expectedHash, bytes)
-      copyBlobToSubject(subject, expectedHash, bytes.length)
+    removeTip(subject, id, position) {
+      removeTip(subject, id, position)
     },
 
     beginBlob() {
@@ -138,19 +122,16 @@ export function createNodeServerStorage(dataDir) {
       renameSync(tempPath, destination)
     },
 
-    async installAttachment(subject, expectedHash, size) {
-      const source = blobFile(expectedHash)
+    requireBlob(expectedHash, size) {
+      const file = blobFile(expectedHash)
       let info
       try {
-        info = statSync(source)
+        info = statSync(file)
       } catch (error) {
         if (error.code === "ENOENT") throw new Error("attachment verification failed")
         throw error
       }
-      if (info.size !== size || await hashFile(source) !== expectedHash) {
-        throw new Error("attachment verification failed")
-      }
-      copyBlobToSubject(subject, expectedHash, size)
+      if (info.size !== size) throw new Error("attachment verification failed")
     },
 
     openBlob(expectedHash) {
@@ -163,8 +144,12 @@ export function createNodeServerStorage(dataDir) {
       }
     },
 
-    readAttachment(subject, expectedHash) {
-      return readFileSync(subjectFile(subject, expectedHash))
+    readBlob(expectedHash) {
+      return readFileSync(blobFile(expectedHash))
+    },
+
+    dropBlob(expectedHash) {
+      rmSync(blobFile(expectedHash), { force: true })
     },
 
     close() {

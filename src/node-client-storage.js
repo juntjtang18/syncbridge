@@ -9,7 +9,7 @@ export function createNodeClientStorage(dataDir) {
     async initSubject(subject) {
       const digest = subjectDigest(subject)
       const directory = subjectDirectory(dataDir, digest)
-      await mkdir(path.join(directory, "attachments"), { recursive: true })
+      await mkdir(directory, { recursive: true })
       await writeIfMissing(path.join(directory, "pointer"), "0")
       await writeIfMissing(path.join(directory, "outbox.jsonl"), "")
       await writeIfMissing(path.join(directory, "subject"), subject)
@@ -75,12 +75,15 @@ export function createNodeClientStorage(dataDir) {
       await writeAtomic(file, `${next}${JSON.stringify(record)}\n`)
     },
 
+    async writeOutbox(digest, records) {
+      const text = records.length === 0 ? "" : `${records.map((record) => JSON.stringify(record)).join("\n")}\n`
+      await writeAtomic(outboxPath(dataDir, digest), text)
+    },
+
     async removeOutbox(digest, ids) {
       const drop = new Set(ids)
       const records = await this.readOutbox(digest)
-      const kept = records.filter((record) => !drop.has(record.id))
-      const text = kept.length === 0 ? "" : `${kept.map((record) => JSON.stringify(record)).join("\n")}\n`
-      await writeAtomic(outboxPath(dataDir, digest), text)
+      await this.writeOutbox(digest, records.filter((record) => !drop.has(record.id)))
     },
 
     async putBlob(digest, expectedHash, bytes) {

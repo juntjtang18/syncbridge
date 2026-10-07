@@ -4,8 +4,12 @@ import path from "node:path"
 import Database from "better-sqlite3"
 import assert from "node:assert/strict"
 import test from "node:test"
-import { subjectDigest } from "../src/index.js"
+import { randomId, sha256, subjectDigest } from "../src/contracts.js"
+import { createFetchTransport } from "../src/fetch-transport.js"
+import { createNodeClientStorage } from "../src/node-client-storage.js"
+import { createClient } from "../src/sync-client.js"
 import { createSyncClient, createSyncServer } from "../src/node.js"
+import { assertNoClientStaging, assertNoServerStaging, createHostStore } from "../testing/host.js"
 import { listen } from "../testing/listen.js"
 
 const subjectA = "user.4.google.folder-a"
@@ -121,6 +125,75 @@ test("e2e: after changelog sync, an old known subject reuses its pointer", async
   assert.deepEqual(continued, { subject: subjectA })
   assert.equal(await pointerOf(dirs.client, subjectA), "2")
   assert.deepEqual(logSubjects(dirs.server), [subjectA, subjectB, subjectA])
+})
+
+test("e2e: a Node client syncs a file onto the server and staging is deleted", async (t) => {
+  const dirs = await tempDirs(t)
+  const photo = Buffer.from("node-photo")
+  const store = createHostStore([["shot.jpg", photo]])
+  const applied = []
+  const server = createSyncServer({ dataDir: dirs.server })
+  t.after(() => server.close())
+  const endpoints = await listen(server, t)
+  server.init(subjectA, async (entry, attachments) => {
+    applied.push(Buffer.from(await attachments.get("photo-1").read()))
+    store.put("server/shot.jpg", photo)
+    return { attachments: [{ id: "photo-1", path: "server/shot.jpg" }] }
+  })
+
+  const client = createSyncClient({ dataDir: dirs.client, url: endpoints.url })
+  await client.use(subjectA, async () => {}, { readAttachment: store.readAttachment })
+  await client.appendChanges({
+    data: { object: "photo", action: "add" },
+    attachments: [{ id: "photo-1", path: "shot.jpg", contentType: "image/jpeg" }],
+  })
+  await assertNoClientStaging(dirs.client)
+  await client.sync()
+  assert.deepEqual(applied, [photo])
+  await assertNoServerStaging(dirs.server)
+  await assertNoClientStaging(dirs.client)
+
+  const received = []
+  const other = createSyncClient({ dataDir: path.join(path.dirname(dirs.client), "client-b"), url: endpoints.url })
+  await other.use(subjectA, async (entry, attachments) => {
+    received.push({
+      path: entry.package.attachments[0].path,
+      bytes: Buffer.from(await attachments.get("photo-1").read()),
+    })
+  }, { readAttachment: store.readAttachment })
+  await other.sync()
+  assert.deepEqual(received, [{ path: "server/shot.jpg", bytes: photo }])
+})
+
+test("e2e: an Expo-style client syncs a file onto the server and staging is deleted", async (t) => {
+  const dirs = await tempDirs(t)
+  const photo = Buffer.alloc(64 * 1024, 0x41)
+  const store = createHostStore([["shot.jpg", photo]])
+  const applied = []
+  const server = createSyncServer({ dataDir: dirs.server })
+  t.after(() => server.close())
+  const endpoints = await listen(server, t)
+  server.init(subjectA, async (entry, attachments) => {
+    applied.push(Buffer.from(await attachments.get("photo-1").read()))
+    store.put("server/shot.jpg", photo)
+    return { attachments: [{ id: "photo-1", path: "server/shot.jpg" }] }
+  })
+
+  const client = createClient({
+    storage: createNodeClientStorage(dirs.client),
+    transport: createFetchTransport({ url: endpoints.url }),
+    sha256,
+    randomId,
+  })
+  await client.use(subjectA, async () => {}, { readAttachment: store.readAttachment })
+  await client.appendChanges({
+    data: { object: "photo", action: "add" },
+    attachments: [{ id: "photo-1", path: "shot.jpg", contentType: "image/jpeg" }],
+  })
+  await client.sync()
+  assert.deepEqual(applied, [photo])
+  await assertNoServerStaging(dirs.server)
+  await assertNoClientStaging(dirs.client)
 })
 
 async function pointerOf(dataDir, subject) {

@@ -1,4 +1,4 @@
-import { requireDataDir, requireUrl } from "./contracts.js"
+import { randomId, requireDataDir, requireUrl, sha256 } from "./contracts.js"
 import { createHttpTransport } from "./http-transport.js"
 import { createNodeClientStorage } from "./node-client-storage.js"
 import { createNodeServerStorage } from "./node-server-storage.js"
@@ -14,6 +14,8 @@ export function createSyncClient({ dataDir, url, headers }) {
   return createClient({
     storage: createNodeClientStorage(dataDir),
     transport: createHttpTransport({ url, headers }),
+    sha256,
+    randomId,
   })
 }
 

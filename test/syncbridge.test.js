@@ -7,6 +7,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { subjectDigest } from "../src/index.js"
 import { createSyncClient, createSyncServer } from "../src/node.js"
+import { assertNoClientStaging, assertNoServerStaging, createHostStore } from "../testing/host.js"
 import { listen } from "../testing/listen.js"
 
 const subject = "tenant.company-123"
@@ -46,14 +47,14 @@ test("init validates inputs and creates subject state without syncing", async (t
   await assert.rejects(() => client.appendChanges({ data: undefined }), /package.data/)
   await assert.rejects(
     () => client.appendChanges({ data: "x", attachments: [{ id: "photo" }] }),
-    /attachment.bytes is required/,
+    /attachment.path/,
   )
   await assert.rejects(
     () => client.appendChanges({
       data: "x",
       attachments: [
-        { id: "a", bytes: Buffer.from("a") },
-        { id: "a", bytes: Buffer.from("b") },
+        { id: "a", path: "a.jpg" },
+        { id: "a", path: "b.jpg" },
       ],
     }),
     /duplicate attachment id/,
@@ -64,6 +65,7 @@ test("two clients sync one subject through the server log", async (t) => {
   const dirs = await tempDirs(t)
   const photo = Buffer.from("photo-bytes")
   const photoHash = sha256(photo)
+  const store = createHostStore([["poi-1.jpg", photo]])
   let serverApplies = 0
   const server = createSyncServer({ dataDir: dirs.server })
   t.after(() => server.close())
@@ -74,24 +76,25 @@ test("two clients sync one subject through the server log", async (t) => {
     assert.equal(file.sha256, photoHash)
     assert.deepEqual(Buffer.from(await file.read()), photo)
     assert.equal(entry.package.data.poi, "north-wall")
+    store.put("server/poi-1.jpg", photo)
+    return { attachments: [{ id: "photo-1", path: "server/poi-1.jpg" }] }
   })
 
   const clientA = createSyncClient({
     dataDir: dirs.clientA,
     url: endpoints.url,
   })
-  await clientA.init(subject, async () => {})
+  await clientA.init(subject, async () => {}, { readAttachment: store.readAttachment })
   const appended = await clientA.appendChanges({
     data: {
       poi: "north-wall",
       poiEntries: [{ description: "Close-up", photo: { attachmentId: "photo-1" } }],
     },
-    attachments: [{ id: "photo-1", bytes: photo, contentType: "image/jpeg", name: "poi-1.jpg" }],
+    attachments: [{ id: "photo-1", path: "poi-1.jpg", contentType: "image/jpeg" }],
   })
 
   const digest = subjectDigest(subject)
-  const cached = await readFile(path.join(dirs.clientA, "subjects", digest, "attachments", photoHash))
-  assert.deepEqual(cached, photo)
+  await assertNoClientStaging(dirs.clientA)
   const outbox = await readFile(path.join(dirs.clientA, "subjects", digest, "outbox.jsonl"), "utf8")
   assert.match(outbox, new RegExp(appended.id))
 
@@ -99,8 +102,8 @@ test("two clients sync one subject through the server log", async (t) => {
   assert.equal(serverApplies, 1)
   assert.equal(await readFile(path.join(dirs.clientA, "subjects", digest, "pointer"), "utf8"), "1")
   assert.equal(await readFile(path.join(dirs.clientA, "subjects", digest, "outbox.jsonl"), "utf8"), "")
-  const serverPhoto = await readFile(path.join(dirs.server, "attachments", digest, photoHash))
-  assert.deepEqual(serverPhoto, photo)
+  await assertNoServerStaging(dirs.server)
+  await assertNoClientStaging(dirs.clientA)
 
   const seen = []
   const clientB = createSyncClient({
@@ -112,7 +115,7 @@ test("two clients sync one subject through the server log", async (t) => {
     attempts += 1
     if (attempts === 1) throw new Error("apply failed")
     seen.push({ data: entry.package.data, bytes: await attachments.get("photo-1").read() })
-  })
+  }, { readAttachment: store.readAttachment })
   await assert.rejects(() => clientB.sync(), /apply failed/)
   assert.equal(await readFile(path.join(dirs.clientB, "subjects", digest, "pointer"), "utf8"), "0")
   await clientB.sync()
@@ -121,6 +124,7 @@ test("two clients sync one subject through the server log", async (t) => {
   assert.equal(seen[0].data.poi, "north-wall")
   assert.deepEqual(Buffer.from(seen[0].bytes), photo)
   assert.equal(await readFile(path.join(dirs.clientB, "subjects", digest, "pointer"), "utf8"), "1")
+  await assertNoClientStaging(dirs.clientB)
 
   const db = new Database(path.join(dirs.server, "syncbridge.sqlite"), { readonly: true })
   const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all()

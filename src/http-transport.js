@@ -1,22 +1,23 @@
-import { createReadStream, createWriteStream } from "node:fs"
+import { createWriteStream } from "node:fs"
 import http from "node:http"
 import https from "node:https"
-import { stat } from "node:fs/promises"
 import { pipeline } from "node:stream/promises"
 
 export function createHttpTransport({ url, headers }) {
   return {
-    async put(hash, filePath) {
-      const info = await stat(filePath)
-      await send({
-        url: withHash(url, hash),
+    async put(body) {
+      const extra = { "content-type": "application/octet-stream" }
+      if (body instanceof Uint8Array) extra["content-length"] = String(body.byteLength)
+      const { status, text } = await send({
+        url,
         method: "PUT",
-        headers: await requestHeaders(headers, {
-          "content-type": "application/octet-stream",
-          "content-length": String(info.size),
-        }),
-        body: createReadStream(filePath),
+        headers: await requestHeaders(headers, extra),
+        body: putBody(body),
+        withStatus: true,
       })
+      if (status < 200 || status >= 300) throw errorFrom(Buffer.from(text || ""))
+      const parsed = text ? JSON.parse(text) : {}
+      return { sha256: parsed.sha256, size: parsed.size }
     },
 
     async post(body) {
@@ -46,6 +47,11 @@ export function createHttpTransport({ url, headers }) {
       })
     },
   }
+}
+
+function putBody(body) {
+  if (body instanceof Uint8Array) return Buffer.from(body)
+  return body
 }
 
 function withHash(url, hash) {
