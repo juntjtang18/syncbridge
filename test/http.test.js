@@ -1,9 +1,14 @@
 import { createHash } from "node:crypto"
-import { mkdtemp, readdir, rm } from "node:fs/promises"
+import { createReadStream, createWriteStream } from "node:fs"
+import { mkdtemp, readdir, rm, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
+import { Readable, Writable } from "node:stream"
 import assert from "node:assert/strict"
 import test from "node:test"
+import { createFetchTransport } from "../src/fetch-transport.js"
+import { createNodeClientStorage } from "../src/node-client-storage.js"
+import { createClient } from "../src/sync-client.js"
 import { createSyncClient, createSyncServer } from "../src/node.js"
 import { listen } from "../testing/listen.js"
 
@@ -129,6 +134,54 @@ test("POST echoes the live subject and refuses a stale one", async (t) => {
     attachmentHashes: [],
   })
 })
+
+test("an Expo-style fetch stream client syncs a changelog and attachment both ways", async (t) => {
+  const dirs = await tempDirs(t)
+  const photo = Buffer.alloc(256 * 1024, 0x5a)
+  let serverApplies = 0
+  const server = createSyncServer({ dataDir: dirs.server })
+  t.after(() => server.close())
+  const endpoints = await listen(server, t)
+  server.init(subject, async (entry, attachments) => {
+    serverApplies += 1
+    assert.equal(entry.package.data.poi, "south-wall")
+    assert.deepEqual(Buffer.from(await attachments.get("photo-1").read()), photo)
+  })
+
+  const sender = createExpoStyleClient({ dataDir: dirs.client, url: endpoints.url })
+  await sender.init(subject, async () => {})
+  await sender.appendChanges({
+    data: { poi: "south-wall" },
+    attachments: [{ id: "photo-1", bytes: photo, contentType: "image/jpeg", name: "poi-1.jpg" }],
+  })
+  await sender.sync()
+  assert.equal(serverApplies, 1)
+
+  const received = []
+  const receiver = createExpoStyleClient({ dataDir: path.join(path.dirname(dirs.client), "client-b"), url: endpoints.url })
+  await receiver.init(subject, async (entry, attachments) => {
+    received.push({
+      data: entry.package.data,
+      bytes: await attachments.get("photo-1").read(),
+    })
+  })
+  await receiver.sync()
+  assert.equal(received.length, 1)
+  assert.equal(received[0].data.poi, "south-wall")
+  assert.deepEqual(Buffer.from(received[0].bytes), photo)
+})
+
+function createExpoStyleClient({ dataDir, url }) {
+  return createClient({
+    storage: createNodeClientStorage(dataDir),
+    transport: createFetchTransport({
+      url,
+      openRead: (filePath) => Readable.toWeb(createReadStream(filePath)),
+      openWrite: (filePath) => Writable.toWeb(createWriteStream(filePath)),
+      size: async (filePath) => (await stat(filePath)).size,
+    }),
+  })
+}
 
 test("a throwing applyChange rolls the log tip back through the handler", async (t) => {
   const dirs = await tempDirs(t)

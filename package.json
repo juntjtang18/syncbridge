@@ -4,13 +4,24 @@
   "type": "module",
   "exports": {
     ".": "./src/index.js",
-    "./node": "./src/node.js"
+    "./node": "./src/node.js",
+    "./expo": "./src/expo.js"
   },
   "scripts": {
     "test": "node --test"
   },
   "dependencies": {
     "better-sqlite3": "^12.4.1"
+  },
+  "peerDependencies": {
+    "expo": "*",
+    "expo-crypto": "*",
+    "expo-file-system": "*"
+  },
+  "peerDependenciesMeta": {
+    "expo": { "optional": true },
+    "expo-crypto": { "optional": true },
+    "expo-file-system": { "optional": true }
   },
   "engines": {
     "node": ">=22"
