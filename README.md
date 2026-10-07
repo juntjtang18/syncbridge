@@ -93,7 +93,7 @@ syncServer.init(subject, async (entry, attachments) => {
 })
 ```
 
-On the client, pass it to `client.use(subject, applyChange)`. That call sets **current**. `sync()` and `appendChanges` use current only. A subject this device has never seen starts at pointer `0`. A known subject reuses its pointer. Write each entry into local business storage, then return. Throw if the write fails: the pointer stays put, and the next `sync()` tries the same entry again.
+On the client, pass it to `client.use(subject, applyChange, { readAttachment })`. That call sets **current**. `sync()` and `appendChanges` use current only. A subject this device has never seen starts at pointer `0`. A known subject reuses its pointer. Write each entry into local business storage, then return. Throw if the write fails: the pointer stays put, and the next `sync()` tries the same entry again.
 
 ```js
 const client = createSyncClient({
@@ -106,7 +106,7 @@ await client.use(subject, async (entry, attachments) => {
   const bytes = await photo.read()
   // Your code: store entry.package.data and bytes in local business storage.
   // Throw if that store fails.
-})
+}, { readAttachment })
 ```
 
 4. `subject` is one opaque string. The application composes and escapes it. SyncBridge stores and compares that string and does not parse tenant, driver, or folder meaning. When the configured root can change, the application includes that root in the string (`user.{id}.{driver}.{root}`). One subject is one server `changelog0`. The client persists every subject it has seen, plus which one is current.
@@ -118,17 +118,17 @@ await client.use(subject, async (entry, attachments) => {
 "user.4.google.1AbCfolderId"
 ```
 
-5. After the app writes a local business change, call `appendChanges(package)`. This stores the change and its attachment bytes in the client retry queue. A network connection is not required.
+5. After the app writes a local business change, call `appendChanges(package)`. This stores the change and an attachment `path` in the client retry queue. A network connection is not required. SyncBridge does not copy the file.
 
-6. A package is `{ data, attachments }`. `data` is a string or any JSON value. Each attachment at append time is `{ id, bytes, contentType, name }`. SyncBridge hashes the bytes and keeps a manifest `{ id, sha256, size, contentType, name }` in the log. It does not look inside `data` to find which attachment belongs to which field.
+6. A package is `{ data, attachments }`. `data` is a string or any JSON value. Each attachment at append time is `{ id, path, contentType }`. `path` is a host pointer. `sync()` streams it through `readAttachment`. The server hashes the PUT stream and stores `{ id, sha256, size, contentType, path }` in the log. It does not look inside `data`.
 
-7. Call `sync()` when the network is available or when the user refreshes. SyncBridge does not poll. `sync()` uploads missing attachment bytes, posts the queued changes, downloads attachment bytes the client does not have, then calls `applyChange` for each server entry after the saved pointer. The pointer advances only after `applyChange` succeeds.
+7. Call `sync()` when the network is available or when the user refreshes. SyncBridge does not poll. `sync()` PUTs attachment streams, posts the queued changes, then calls `applyChange` for each server entry after the saved pointer. The pointer advances only after `applyChange` succeeds. Staging files are deleted after a successful apply.
 
 8. On the server, `handle` branches on the method and the parameters. The host path stays `/sync` in this example only because the host bound it there.
 
-- `PUT /sync?sha256=ab12...` streams the body to a temp file and hashes each chunk. A matching hash and size renames the file into the attachment store. A mismatch deletes the temp file.
-- `POST /sync` reads `{ subject, pointer, changes }`. The host names the live subject. If the request subject is not live, the host rejects and still returns `{ subject }`. If it is live, SyncServer appends each new change to that subject's log, stages any attachment the package names, then calls the host `applyChange(entry, attachments)`. The response is `{ acceptedIds, entries, attachmentHashes, subject }`. The client compares `subject` to the one it sent and `use`s the live string if they differ. The same change id is accepted once. Attachment `PUT` / `GET` do not carry a subject.
-- `GET /sync?sha256=ab12...` streams the stored file back.
+- `PUT /sync` streams the body, hashes each chunk, and responds `{ sha256, size }`. The temp file lasts only until `applyChange` succeeds.
+- `POST /sync` reads `{ subject, pointer, changes }`. The host names the live subject. If the request subject is not live, the host rejects and still returns `{ subject }`. If it is live, SyncServer appends each new change, calls `applyChange`, then deletes the PUT temp. The response is `{ acceptedIds, entries, attachmentHashes, subject }`. The client compares `subject` to the one it sent and `use`s the live string if they differ. The same change id is accepted once.
+- `GET /sync?sha256=ab12...` streams the in-flight PUT temp only.
 
 9. `attachments.get(id).read()` returns the staged bytes for that entry. Throw from `applyChange` if the business write fails. The client pointer stays put, and a failed server apply removes the new log tip so the same change id can be tried again.
 
@@ -152,12 +152,12 @@ async function applyChange(entry, attachments) {
   for (const manifest of entry.package.attachments) {
     const file = attachments.get(manifest.id)
     const bytes = await file.read()
-    await writeFile(path.join(folder, file.name || manifest.id), bytes)
+    await writeFile(path.join(folder, file.path || manifest.id), bytes)
   }
 }
 
 syncServer.init(subject, applyChange)
-await client.use(subject, applyChange)
+await client.use(subject, applyChange, { readAttachment })
 ```
 
 Host server. The process listens. SyncBridge handles the routed request. `applyChange` is the function above.
@@ -203,9 +203,8 @@ await client.appendChanges({
   attachments: [
     {
       id: "photo-1",
-      bytes: photoBytes,
+      path: "poi-1.jpg",
       contentType: "image/jpeg",
-      name: "poi-1.jpg",
     },
   ],
 })

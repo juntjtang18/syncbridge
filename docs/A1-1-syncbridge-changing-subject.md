@@ -10,8 +10,8 @@ A1 assumed one `init(subject)` per client process and no live-root change. The h
 - A subject is one opaque string and one independent ordered log.
 - The server owns that subject's `changelog0`. Positions start at `1` only inside that subject.
 - The server stores no client pointer.
-- Package, attachments, and `applyChange` are unchanged.
-- Attachment `PUT` / `GET` stay hash-only. They do not carry a subject.
+- Package and `applyChange` stay as in A1 / A1-2. Attachment `path` is a host pointer.
+- `PUT /sync` and `GET /sync?sha256=` do not carry a subject.
 
 ## 2. Subject names the root
 

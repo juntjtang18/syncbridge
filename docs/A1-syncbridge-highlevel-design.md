@@ -2,7 +2,8 @@
 
 **Status:** 2026-10-06  
 **Requirements:** [A0](./A0-syncbridge-requirements.md)  
-**Changing subject:** [A1-1](./A1-1-syncbridge-changing-subject.md)
+**Changing subject:** [A1-1](./A1-1-syncbridge-changing-subject.md)  
+**Attachment pointer:** [A1-2](./A1-2-attachment-internal-uri.md)
 
 SyncBridge is middleware for client-server synchronization. It moves opaque change packages. The application decides what a package means and supplies `applyChange` to write that package into its business storage.
 
@@ -78,7 +79,7 @@ Each record in `changelog0` is:
 {
   data: JSONValue,
   attachments: [
-    { id, sha256, size, contentType, name }
+    { id, sha256, size, contentType, path }
   ],
 }
 ```
@@ -89,46 +90,31 @@ Each record in `changelog0` is:
 { data: "plain text", attachments: [] }
 ```
 
-`attachments` is a sibling of `data`, not part of an application's business schema. It is the generic file mechanism. Each entry is a manifest, not the file bytes. `id` is an application-selected reference, `sha256` identifies the exact byte content, `size` verifies its length, and `contentType` and `name` are optional metadata. Business data can refer to `attachments[].id`, but SyncBridge does not inspect that relationship.
+`attachments` is a sibling of `data`, not part of an application's business schema. It is the generic file mechanism. Each entry is a manifest, not the file bytes. `id` is an application-selected reference. `path` is a host-internal pointer; SyncBridge does not parse it. `sha256` and `size` are filled when the PUT stream is hashed. `contentType` is optional. Business data can refer to `attachments[].id`, but SyncBridge does not inspect that relationship.
 
 SyncBridge serializes the package as JSON, but never evaluates or runs its `data`. A SQL or script string is only data to SyncBridge; it becomes dangerous only if an application's `applyChange` chooses to execute it.
 
-The package passed to `appendChanges` has the same shape, except every attachment supplies `bytes` instead of `sha256` and `size`. SyncBridge hashes those bytes, saves them, and writes the resulting manifest into the queued package and server log.
+The package passed to `appendChanges` supplies `{ id, path, contentType }` per attachment. No `bytes`. The host's `readAttachment` streams the file at `sync()`. The server hashes the PUT stream and returns `{ sha256, size }`.
 
 SyncServer owns the log mechanics: assigning positions, keeping order, and returning records after a position. It does not store a pointer for any client.
 
 ## 3. Attachments
 
-A file path alone cannot be in a package: that path exists only on the node that made the change. Putting every file byte directly into `changelog0` would duplicate large files in every replay.
-
-SyncBridge stores attachment bytes separately, content-addressed by their SHA-256 hash:
-
-```text
-<dataDir>/<encoded-subject>/attachments/<sha256>
-```
-
-The same bytes are stored once per subject. The log stores only the attachment manifest. A sender gives file bytes to `appendChanges`; SyncBridge hashes and saves the bytes, then writes the hash into the queued package.
-
-Attachment bytes have two server/client lifetimes:
-
-- The server's subject attachment store is the durable source for replaying a log entry to later clients.
-- A client has one immutable content-addressed blob cache per subject. Outgoing and received attachments use the same `<sha256>` file.
+See [A1-2](./A1-2-attachment-internal-uri.md). SyncBridge does not keep a durable blob store. `path` is the host pointer. Bytes move through `readAttachment(manifest)` or the in-flight PUT temp.
 
 During `sync()`:
 
 ```text
-sender         upload attachment bytes missing on server
-server         verify hash and size, save attachment bytes
+sender         readAttachment streams the host file
+server         hash the PUT stream, return sha256 and size
 server         append the package manifest to changelog0
-receiver       download referenced attachment bytes it does not have
-receiver       verify hash and size, save bytes in blob cache
+server         applyChange, then delete the PUT temp
+receiver       readAttachment streams path from the log
 receiver       call applyChange(entry, attachments)
 receiver       advance pointer
 ```
 
-SyncBridge never calls `applyChange` until all attachments referenced by that entry are present and verified locally. If a hash is already in the client blob cache, it does not download another copy. New bytes are written to a temporary file, verified, then atomically moved to the hash path. It passes an attachment reader with the entry. `applyChange` moves or copies each attachment into the application's final destination. SyncBridge does not know that destination or whether it is a database, OneDrive, a local file, or another store.
-
-The application returns success from `applyChange` only after its final business data and attachment destination are complete. Then SyncBridge advances the pointer. It retains the cache file, because it may be used by a queued outgoing package or a later received entry. A later garbage collector can remove unreferenced cache files. If attachment transfer or `applyChange` fails, the pointer stays unchanged and the next `sync()` retries the entry.
+`applyChange` may return `{ attachments: [{ id, path }] }` so the log's `path` matches where the host stored the file. If transfer or `applyChange` fails, the pointer stays unchanged and the next `sync()` retries.
 
 The callback contract is:
 
@@ -152,7 +138,7 @@ async function applyChange(entry, attachments) {
   sha256,
   size,
   contentType,
-  name,
+  path,
   async read(), // Promise<Uint8Array>
 }
 ```
@@ -171,7 +157,7 @@ For Site Inspect, `data` can be the PoI and PoI-entry descriptions; every photo 
     ],
   },
   attachments: [
-    { id: "photo-1", bytes: photoBytes, contentType: "image/jpeg", name: "poi-1.jpg" },
+    { id: "photo-1", path: "poi-1.jpg", contentType: "image/jpeg" },
   ],
 }
 ```
@@ -182,16 +168,15 @@ The platform entry creates a client once. That client holds **many subjects** an
 
 ```js
 const client = createSyncClient({ dataDir, send })
-await client.use(subject, applyChange)
+await client.use(subject, applyChange, { readAttachment })
 ```
 
-`dataDir` is a persistent app directory. The Node entry uses Node file APIs; the Expo entry uses Expo file APIs. SyncBridge persists the current subject and, for every subject this device has seen, that subject's pointer, outbox, and attachment cache:
+`dataDir` is a persistent app directory. The Node entry uses Node file APIs; the Expo entry uses Expo file APIs. SyncBridge persists the current subject and, for every subject this device has seen, that subject's pointer and outbox. It does not copy attachment bytes:
 
 ```text
 <dataDir>/current
 <dataDir>/subjects/<encoded-subject>/pointer
 <dataDir>/subjects/<encoded-subject>/outbox.jsonl
-<dataDir>/subjects/<encoded-subject>/attachments/<sha256>
 ```
 
 That directory set is the persisted list `{ subject, pointer }`. There is no second index. A subject this client has never seen gets `pointer` `0`: every server log entry is new. A subject this client has seen keeps its file. Changing current does not rewrite another subject's pointer.
@@ -199,7 +184,7 @@ That directory set is the persisted list `{ subject, pointer }`. There is no sec
 The public client API is:
 
 ```text
-use(subject, applyChange)   // create if new, reuse pointer if known, set current
+use(subject, applyChange, { readAttachment })   // create if new, reuse pointer if known, set current
 current() → subject | null
 subjects() → [subject]
 appendChanges(changeLog)    // queues on current (offline ok)
