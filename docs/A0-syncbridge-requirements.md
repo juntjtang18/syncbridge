@@ -26,25 +26,25 @@ SyncBridge is client-server middleware for synchronizing opaque application chan
 ## 3. Client
 
 11. The platform creates a client with a persistent `dataDir` and a transport `send` function. One client holds many subjects and one current subject.
-12. The client API is `use(subject, applyChange, { readAttachment })`, `current()`, `subjects()`, `sync()`, and `appendChanges(package)`. `use` creates the subject if new, reuses its pointer if known, and sets current. `sync` and `appendChanges` apply to current only. `readAttachment(manifest)` is the host callback that streams bytes for `path`.
+12. The client API is `use(subject, applyChange, { readAttachment })`, `current()`, `subjects()`, `sync()`, and `appendChanges(package)`. `use` creates the subject if new, reuses its pointer if known, and sets current. `sync` and `appendChanges` apply to current only. `readAttachment(manifest)` is the host callback that streams bytes for an outbox `path` when sending.
 13. SyncBridge owns, per subject, the client's pointer and outgoing retry queue inside its `dataDir`. It also persists which subject is current. It does not copy attachment bytes into `dataDir`.
 14. `appendChanges` queues a local change on the current subject without requiring a network connection. Unsent work stays on that subject's outbox if current moves away.
 15. `sync()` happens only when the application calls it; SyncBridge does not poll.
 16. `sync()` sends the current subject's queued changes, receives server entries after that subject's pointer, and advances that pointer only after `applyChange` succeeds.
-16a. Every `POST /sync` response includes the host's live `subject`. The client compares it to the subject it sent. If they differ, the client `use`s the live subject and does not apply the stale body. `PUT /sync` streams bytes and returns `{ sha256, size }`. `GET /sync?sha256=` reads the in-flight PUT temp only.
+16a. Every `POST /sync` response includes the host's live `subject`. The client compares it to the subject it sent. If they differ, the client `use`s the live subject and does not apply the stale body. `PUT /sync` streams bytes and returns `{ sha256, size }`. `GET /sync?sha256=` reads the in-flight PUT temp. After that temp is deleted, the same GET streams the live subject's `readAttachment` for the log manifest with that hash. The changelog stores `path`, not a URL.
 16b. If the request subject is not the live subject, the host does not append to that log. It rejects and still returns the live subject.
 
 ## 4. applyChange
 
-17. SyncBridge calls `await applyChange(entry, attachments)` for one received entry. `attachments.get(id).read()` calls `readAttachment` (client) or reads the in-flight PUT temp (server).
+17. SyncBridge calls `await applyChange(entry, attachments)` for one received entry. On the server, during the upload that just arrived, `attachments.get(id).read()` reads the in-flight PUT temp. On the client, `attachments.get(id).read()` for a received entry calls `GET /sync?sha256=`. The client's `readAttachment` is only for sending.
 18. `attachments.get(id).read()` returns verified bytes for an attachment named in that entry.
 19. The callback writes business data and copies or moves attachment bytes to the application's final destination. It throws on failure.
 20. If the callback or an attachment transfer fails, the pointer stays unchanged and the entry is retried on the next sync.
 
 ## 5. Server
 
-21. The server creates SyncServer with a persistent `dataDir`; SyncServer owns the ordered log, duplicate IDs, and a short-lived PUT temp.
-22. SyncServer persists entries in its SQLite file under `dataDir`, indexed by subject and position. Attachment bytes are not kept after `applyChange` succeeds. `applyChange` may return `{ attachments: [{ id, path }] }` to update `path` on that log row.
+21. The server creates SyncServer with a persistent `dataDir`; SyncServer owns the ordered log, duplicate IDs, and a short-lived PUT temp. `init(subject, applyChange, { readAttachment })` registers the host reader for that subject.
+22. SyncServer persists entries in its SQLite file under `dataDir`, indexed by subject and position. Attachment bytes are not kept after `applyChange` succeeds. `applyChange` may return `{ attachments: [{ id, path }] }` to update `path` on that log row. A later `GET /sync?sha256=` calls `readAttachment` with that manifest.
 23. A client sends `{ subject, pointer, changes }`. When that subject is live, SyncServer appends each new client change once, calls the server `applyChange` for each accepted client change, and returns entries after `pointer` plus the live `subject`.
 24. A BizServer local change is appended to the log but is not applied again: BizServer already wrote its own business storage.
 

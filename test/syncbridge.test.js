@@ -67,7 +67,10 @@ test("two clients sync one subject through the server log", async (t) => {
   const photoHash = sha256(photo)
   const store = createHostStore([["poi-1.jpg", photo]])
   let serverApplies = 0
-  const server = createSyncServer({ dataDir: dirs.server })
+  const server = createSyncServer({
+    dataDir: dirs.server,
+    currentSubject() { return subject },
+  })
   t.after(() => server.close())
   const endpoints = await listen(server, t)
   server.init(subject, async (entry, attachments) => {
@@ -78,7 +81,7 @@ test("two clients sync one subject through the server log", async (t) => {
     assert.equal(entry.package.data.poi, "north-wall")
     store.put("server/poi-1.jpg", photo)
     return { attachments: [{ id: "photo-1", path: "server/poi-1.jpg" }] }
-  })
+  }, { readAttachment: store.readAttachment })
 
   const clientA = createSyncClient({
     dataDir: dirs.clientA,

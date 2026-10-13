@@ -1,13 +1,16 @@
 import { createReadStream } from "node:fs"
 import { pipeline } from "node:stream/promises"
 import {
+  asBytes,
   createAttachmentReader,
   persistedPackage,
   preparePackage,
   randomId,
   requireApplyChange,
   requirePointer,
+  requireReadAttachment,
   requireSubject,
+  sha256,
 } from "./contracts.js"
 import { writeHashed } from "./hash-stream.js"
 
@@ -25,11 +28,12 @@ export function createServer({ storage, currentSubject }) {
   }
 
   return {
-    init(subject, applyChange) {
+    init(subject, applyChange, options) {
       const key = requireSubject(subject)
       requireApplyChange(applyChange)
+      const readAttachment = requireReadAttachment(options?.readAttachment)
       if (callbacks.has(key)) throw new Error(`subject already initialized: ${key}`)
-      callbacks.set(key, applyChange)
+      callbacks.set(key, { applyChange, readAttachment })
     },
 
     handle(req, res) {
@@ -71,7 +75,7 @@ async function dispatch(req, res, storage, callbacks, currentSubject) {
     return
   }
   if (req.method === "GET") {
-    await handleGet(res, storage, query)
+    await handleGet(req, res, storage, callbacks, currentSubject, query)
     return
   }
   res.writeHead(405, { Allow: "GET, POST, PUT" })
@@ -110,25 +114,56 @@ async function handlePost(req, storage, callbacks, currentSubject) {
   return { status: 200, body: { ...result, subject } }
 }
 
-async function handleGet(res, storage, query) {
+async function handleGet(req, res, storage, callbacks, currentSubject, query) {
   const expected = requireSha256(query)
   const blob = storage.openBlob(expected)
-  if (!blob) {
+  if (blob) {
+    res.writeHead(200, {
+      "Content-Type": "application/octet-stream",
+      "Content-Length": blob.size,
+    })
+    await pipeline(createReadStream(blob.file), res)
+    return
+  }
+  if (currentSubject === undefined) {
     res.writeHead(404)
     res.end()
     return
   }
+  const live = requireSubject(await currentSubject(req))
+  const registered = callbacks.get(live)
+  const manifest = storage.findAttachment(live, expected)
+  if (!registered?.readAttachment || !manifest) {
+    res.writeHead(404)
+    res.end()
+    return
+  }
+  let bytes
+  try {
+    bytes = asBytes(await registered.readAttachment(manifest), "attachment")
+  } catch (error) {
+    if (isMissing(error)) {
+      res.writeHead(404)
+      res.end()
+      return
+    }
+    throw error
+  }
+  if (sha256(bytes) !== manifest.sha256 || bytes.byteLength !== manifest.size) {
+    throw new Error(`attachment verification failed for ${manifest.id}`)
+  }
   res.writeHead(200, {
     "Content-Type": "application/octet-stream",
-    "Content-Length": blob.size,
+    "Content-Length": bytes.byteLength,
   })
-  await pipeline(createReadStream(blob.file), res)
+  res.end(Buffer.from(bytes))
 }
 
 async function receiveLocked(storage, callbacks, request) {
   if (request === null || typeof request !== "object") throw new TypeError("request must be an object")
   const subject = requireSubject(request.subject)
-  const applyChange = callbacks.get(subject)
+  const registered = callbacks.get(subject)
+  const applyChange = registered?.applyChange
   if (!applyChange) throw new Error(`subject is not initialized: ${subject}`)
   const pointer = requirePointer(request.pointer)
   const changes = request.changes ?? []
@@ -175,6 +210,10 @@ async function receiveLocked(storage, callbacks, request) {
     entries: storage.entriesAfter(subject, pointer),
     attachmentHashes: [],
   }
+}
+
+function isMissing(error) {
+  return error instanceof Error && /missing/i.test(error.message)
 }
 
 function requireSha256(query) {

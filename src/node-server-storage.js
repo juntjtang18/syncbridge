@@ -39,6 +39,12 @@ export function createNodeServerStorage(dataDir) {
   `)
   const selectTip = db.prepare("SELECT MAX(position) AS position FROM log_entries WHERE subject = ?")
   const deleteEntry = db.prepare("DELETE FROM log_entries WHERE subject = ? AND id = ? AND position = ?")
+  const selectPackages = db.prepare(`
+    SELECT package_json
+    FROM log_entries
+    WHERE subject = ?
+    ORDER BY position DESC
+  `)
 
   const append = db.transaction((subject, id, packageValue) => {
     const existing = selectById.get(subject, id)
@@ -77,6 +83,16 @@ export function createNodeServerStorage(dataDir) {
         position: row.position,
         package: JSON.parse(row.package_json),
       }))
+    },
+
+    findAttachment(subject, hash) {
+      requireHash(hash)
+      for (const row of selectPackages.all(subject)) {
+        const packageValue = JSON.parse(row.package_json)
+        const manifest = (packageValue.attachments || []).find((item) => item && item.sha256 === hash)
+        if (manifest) return manifest
+      }
+      return null
     },
 
     updateAttachmentPaths(subject, id, updates) {

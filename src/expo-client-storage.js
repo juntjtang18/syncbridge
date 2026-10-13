@@ -61,6 +61,11 @@ export function createExpoClientStorage(dataDir, { sha256, subjectDigest, random
       await writeAtomic(file, `${next}${JSON.stringify(record)}\n`)
     },
 
+    async writeOutbox(digest, records) {
+      const text = records.length === 0 ? "" : `${records.map((record) => JSON.stringify(record)).join("\n")}\n`
+      await writeAtomic(outboxPath(digest), text)
+    },
+
     async removeOutbox(digest, ids) {
       const drop = new Set(ids)
       const records = await this.readOutbox(digest)

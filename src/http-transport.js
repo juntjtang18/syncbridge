@@ -39,12 +39,15 @@ export function createHttpTransport({ url, headers }) {
     },
 
     async get(hash, filePath) {
-      await send({
+      const body = await send({
         url: withHash(url, hash),
         method: "GET",
         headers: await requestHeaders(headers),
         writeTo: filePath,
+        binary: !filePath,
       })
+      if (filePath) return undefined
+      return body
     },
   }
 }
@@ -68,7 +71,7 @@ async function requestHeaders(headers, extra = {}) {
   return { ...provided, ...extra }
 }
 
-function send({ url, method, headers, body, writeTo, withStatus }) {
+function send({ url, method, headers, body, writeTo, withStatus, binary }) {
   const target = url instanceof URL ? url : new URL(url)
   const lib = target.protocol === "https:" ? https : http
   return new Promise((resolve, reject) => {
@@ -87,6 +90,10 @@ function send({ url, method, headers, body, writeTo, withStatus }) {
       const chunks = []
       res.on("data", (chunk) => chunks.push(chunk))
       res.on("end", () => {
+        if (binary) {
+          resolve(Buffer.concat(chunks))
+          return
+        }
         const text = Buffer.concat(chunks).toString("utf8")
         resolve(withStatus ? { status: res.statusCode, text } : text)
       })

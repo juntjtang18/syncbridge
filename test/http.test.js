@@ -143,7 +143,10 @@ test("an Expo-style fetch stream client syncs a changelog and attachment both wa
   const photo = Buffer.alloc(256 * 1024, 0x5a)
   const store = createHostStore([["poi-1.jpg", photo]])
   let serverApplies = 0
-  const server = createSyncServer({ dataDir: dirs.server })
+  const server = createSyncServer({
+    dataDir: dirs.server,
+    currentSubject() { return subject },
+  })
   t.after(() => server.close())
   const endpoints = await listen(server, t)
   server.init(subject, async (entry, attachments) => {
@@ -152,7 +155,7 @@ test("an Expo-style fetch stream client syncs a changelog and attachment both wa
     assert.deepEqual(Buffer.from(await attachments.get("photo-1").read()), photo)
     store.put("server/poi-1.jpg", photo)
     return { attachments: [{ id: "photo-1", path: "server/poi-1.jpg" }] }
-  })
+  }, { readAttachment: store.readAttachment })
 
   const sender = createExpoStyleClient({ dataDir: dirs.client, url: endpoints.url })
   await sender.init(subject, async () => {}, { readAttachment: store.readAttachment })

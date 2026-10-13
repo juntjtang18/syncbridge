@@ -100,7 +100,7 @@ SyncServer owns the log mechanics: assigning positions, keeping order, and retur
 
 ## 3. Attachments
 
-See [A1-2](./A1-2-attachment-internal-uri.md). SyncBridge does not keep a durable blob store. `path` is the host pointer. Bytes move through `readAttachment(manifest)` or the in-flight PUT temp.
+See [A1-2](./A1-2-attachment-internal-uri.md). SyncBridge does not keep a durable blob store. `path` is the host pointer. The sender streams through `readAttachment`. The server apply of that upload reads the in-flight PUT temp. A later receiver downloads with `GET /sync?sha256=`, and the server streams the stored file through its `readAttachment`.
 
 During `sync()`:
 
@@ -109,7 +109,8 @@ sender         readAttachment streams the host file
 server         hash the PUT stream, return sha256 and size
 server         append the package manifest to changelog0
 server         applyChange, then delete the PUT temp
-receiver       readAttachment streams path from the log
+receiver       GET /sync?sha256=
+server         readAttachment streams path from the log
 receiver       call applyChange(entry, attachments)
 receiver       advance pointer
 ```
@@ -249,8 +250,8 @@ The host supplies the live subject (a `currentSubject(user)` callback, or a wrap
 The server entry creates SyncServer once:
 
 ```js
-const syncServer = createSyncServer({ dataDir })
-syncServer.init(subject, applyChange)
+const syncServer = createSyncServer({ dataDir, currentSubject })
+syncServer.init(subject, applyChange, { readAttachment })
 ```
 
 SyncServer owns `<dataDir>/syncbridge.sqlite`. It stores `log_entries` indexed by `(subject, position)` and `(subject, id)`, so it can return entries after a pointer without scanning a text file. BizServer does not open the database or implement log storage methods.
@@ -273,7 +274,7 @@ BizClient    applyChange(entry, attachments), appendChanges; asks host for live 
 SyncClient   use, current, subjects, sync, appendChanges
 SyncServer   init, receive, appendChanges
 BizServer    applyChange(entry, attachments), appendChanges
-Host         live subject on POST /sync; reject a request subject that is not live
+Host         live subject on POST /sync; reject a request subject that is not live; readAttachment streams path after the PUT temp is gone
 ```
 
 SyncBridge is not built on a normal queue. The client has an outgoing retry queue, but each server subject is a durable replayable log: multiple clients can independently read entries after their own pointers.

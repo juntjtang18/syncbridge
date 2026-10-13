@@ -81,16 +81,17 @@ npm install github:juntjtang18/syncbridge
 
 3. Implement the `applyChange` callback. SyncBridge does not write business data. You write this function, and you pass it to server `init` and client `use`. The server and the client each get their own function. `applyChange` is per subject.
 
-On the server, pass it to `syncServer.init(subject, applyChange)` once for each subject. SyncBridge calls it when a client change is accepted. Write `entry.package.data` and the attachment bytes into server business storage, then return. Throw if the write fails.
+On the server, pass it to `syncServer.init(subject, applyChange, { readAttachment })` once for each subject. SyncBridge calls `applyChange` when a client change is accepted. Write `entry.package.data` and the attachment bytes into server business storage, then return. Return `{ attachments: [{ id, path }] }` when the stored path differs from the sender's path. Throw if the write fails. `readAttachment(manifest)` streams that stored path after the PUT temp is gone.
 
 ```js
-const syncServer = createSyncServer({ dataDir: serverDir })
+const syncServer = createSyncServer({ dataDir: serverDir, currentSubject })
 syncServer.init(subject, async (entry, attachments) => {
   const photo = attachments.get("photo-1")
   const bytes = await photo.read()
   // Your code: store entry.package.data and bytes in server business storage.
   // Throw if that store fails.
-})
+  return { attachments: [{ id: "photo-1", path: storedPath }] }
+}, { readAttachment })
 ```
 
 On the client, pass it to `client.use(subject, applyChange, { readAttachment })`. That call sets **current**. `sync()` and `appendChanges` use current only. A subject this device has never seen starts at pointer `0`. A known subject reuses its pointer. Write each entry into local business storage, then return. Throw if the write fails: the pointer stays put, and the next `sync()` tries the same entry again.
@@ -128,9 +129,9 @@ await client.use(subject, async (entry, attachments) => {
 
 - `PUT /sync` streams the body, hashes each chunk, and responds `{ sha256, size }`. The temp file lasts only until `applyChange` succeeds.
 - `POST /sync` reads `{ subject, pointer, changes }`. The host names the live subject. If the request subject is not live, the host rejects and still returns `{ subject }`. If it is live, SyncServer appends each new change, calls `applyChange`, then deletes the PUT temp. The response is `{ acceptedIds, entries, attachmentHashes, subject }`. The client compares `subject` to the one it sent and `use`s the live string if they differ. The same change id is accepted once.
-- `GET /sync?sha256=ab12...` streams the in-flight PUT temp only.
+- `GET /sync?sha256=ab12...` streams the in-flight PUT temp. After that temp is deleted, it streams `readAttachment` for the live subject's log manifest with that hash. The changelog stores `path`, not a URL.
 
-9. `attachments.get(id).read()` returns the staged bytes for that entry. Throw from `applyChange` if the business write fails. The client pointer stays put, and a failed server apply removes the new log tip so the same change id can be tried again.
+9. On the server, during the upload, `attachments.get(id).read()` returns the PUT temp. On the client, `attachments.get(id).read()` for a received entry downloads `GET /sync?sha256=`. Throw from `applyChange` if the business write fails. The client pointer stays put, and a failed server apply removes the new log tip so the same change id can be tried again.
 
 10. The server stores no pointer for any client. A BizServer change that is already in business storage is appended with `appendChanges(subject, package)` and is not applied again.
 
@@ -156,7 +157,7 @@ async function applyChange(entry, attachments) {
   }
 }
 
-syncServer.init(subject, applyChange)
+syncServer.init(subject, applyChange, { readAttachment })
 await client.use(subject, applyChange, { readAttachment })
 ```
 
@@ -166,8 +167,8 @@ Host server. The process listens. SyncBridge handles the routed request. `applyC
 import http from "node:http"
 import { createSyncServer } from "syncbridge/node"
 
-const syncServer = createSyncServer({ dataDir: serverDir })
-syncServer.init(subject, applyChange)
+const syncServer = createSyncServer({ dataDir: serverDir, currentSubject })
+syncServer.init(subject, applyChange, { readAttachment })
 
 http.createServer((req, res) => {
   const url = new URL(req.url, "http://localhost")

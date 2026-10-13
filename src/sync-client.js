@@ -96,8 +96,7 @@ export function createClient({ storage, transport, sha256, randomId }) {
           const current = await storage.readPointer(digest)
           if (entry.position <= current) continue
           await applyChange(entry, createAttachmentReader(entry.package.attachments, async (manifest) => {
-            if (!readAttachment) throw new Error("readAttachment is required")
-            return readAttachment(manifest)
+            return transport.get(manifest.sha256)
           }, sha256))
           await storage.writePointer(digest, entry.position)
         }

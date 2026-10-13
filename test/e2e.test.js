@@ -132,14 +132,17 @@ test("e2e: a Node client syncs a file onto the server and staging is deleted", a
   const photo = Buffer.from("node-photo")
   const store = createHostStore([["shot.jpg", photo]])
   const applied = []
-  const server = createSyncServer({ dataDir: dirs.server })
+  const server = createSyncServer({
+    dataDir: dirs.server,
+    currentSubject() { return subjectA },
+  })
   t.after(() => server.close())
   const endpoints = await listen(server, t)
   server.init(subjectA, async (entry, attachments) => {
     applied.push(Buffer.from(await attachments.get("photo-1").read()))
     store.put("server/shot.jpg", photo)
     return { attachments: [{ id: "photo-1", path: "server/shot.jpg" }] }
-  })
+  }, { readAttachment: store.readAttachment })
 
   const client = createSyncClient({ dataDir: dirs.client, url: endpoints.url })
   await client.use(subjectA, async () => {}, { readAttachment: store.readAttachment })
