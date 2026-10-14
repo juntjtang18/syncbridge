@@ -13,14 +13,16 @@ import {
   sha256,
 } from "./contracts.js"
 import { writeHashed } from "./hash-stream.js"
+import { createLog, trace } from "./log.js"
 
 const ATTEMPT_LIMIT = 3
 
-export function createServer({ storage, currentSubject }) {
+export function createServer({ storage, currentSubject, log }) {
   if (currentSubject !== undefined && typeof currentSubject !== "function") {
     throw new TypeError("currentSubject must be a function")
   }
   const callbacks = new Map()
+  const sink = createLog(log)
   let tail = Promise.resolve()
   let drain = Promise.resolve()
   let stopped = false
@@ -52,6 +54,8 @@ export function createServer({ storage, currentSubject }) {
 
   async function applyRow(row) {
     const registered = callbacks.get(row.subject)
+    const attempt = row.attempts + 1
+    trace(sink, { side: "server", subject: row.subject, step: "apply", id: row.id, attempt, detail: { position: row.position } })
     try {
       if (!registered?.applyChange) throw new Error(`subject is not initialized: ${row.subject}`)
       const applied = await registered.applyChange(
@@ -61,8 +65,17 @@ export function createServer({ storage, currentSubject }) {
       if (applied?.attachments) storage.updateAttachmentPaths(row.subject, row.id, applied.attachments)
       for (const manifest of row.package.attachments || []) storage.dropBlob(manifest.sha256)
       storage.removeUnprocessed(row.subject, row.id)
+      trace(sink, { side: "server", subject: row.subject, step: "applied", id: row.id, attempt })
     } catch (error) {
       const attempts = row.attempts + 1
+      trace(sink, {
+        side: "server",
+        subject: row.subject,
+        step: "apply-failed",
+        id: row.id,
+        attempt: attempts,
+        error: messageOf(error),
+      })
       if (attempts < ATTEMPT_LIMIT) {
         storage.setUnprocessedAttempts(row.subject, row.id, attempts)
         row.attempts = attempts
@@ -104,8 +117,9 @@ export function createServer({ storage, currentSubject }) {
     handle(req, res) {
       return exclusive(async () => {
         try {
-          await dispatch(req, res, storage, callbacks, currentSubject, wake)
+          await dispatch(req, res, storage, callbacks, currentSubject, wake, sink)
         } catch (error) {
+          trace(sink, { side: "server", step: "error", status: isPredicted(error) ? "failed" : "error", error: messageOf(error) })
           writeAckError(res, error)
         }
       })
@@ -118,6 +132,7 @@ export function createServer({ storage, currentSubject }) {
         const prepared = preparePackage(input)
         const id = randomId()
         const result = storage.appendEntry(key, id, prepared.package)
+        trace(sink, { side: "server", subject: key, step: "append", id, detail: { position: result.position } })
         return { id, position: result.position }
       })
     },
@@ -132,7 +147,11 @@ export function createServer({ storage, currentSubject }) {
 
     setUnprocessed(subject, rows) {
       const key = requireSubject(subject)
-      storage.replaceUnprocessed(key, normalizeQueue(rows, "unprocessed"))
+      const queued = normalizeQueue(rows, "unprocessed")
+      storage.replaceUnprocessed(key, queued)
+      for (const row of queued) {
+        trace(sink, { side: "server", subject: key, step: "enqueue", id: row.id, detail: { position: row.position } })
+      }
       wake()
     },
 
@@ -150,42 +169,46 @@ export function createServer({ storage, currentSubject }) {
   }
 }
 
-async function dispatch(req, res, storage, callbacks, currentSubject, wake) {
+async function dispatch(req, res, storage, callbacks, currentSubject, wake, log) {
   const query = new URL(req.url || "/", "http://localhost").searchParams
   if (req.method === "PUT") {
-    await handlePut(req, res, storage)
+    await handlePut(req, res, storage, log)
     return
   }
   if (req.method === "POST") {
-    const result = await handlePost(req, storage, callbacks, currentSubject, wake)
+    const result = await handlePost(req, storage, callbacks, currentSubject, wake, log)
     sendJson(res, result.status, result.body)
     return
   }
   if (req.method === "GET") {
-    await handleGet(req, res, storage, callbacks, currentSubject, query)
+    await handleGet(req, res, storage, callbacks, currentSubject, query, log)
     return
   }
   res.writeHead(405, { Allow: "GET, POST, PUT" })
   res.end()
 }
 
-async function handlePut(req, res, storage) {
+async function handlePut(req, res, storage, log) {
   const tempPath = storage.beginBlob()
+  trace(log, { side: "server", step: "put" })
   try {
     const written = await writeHashed(req, tempPath)
     storage.commitBlob(written.hash, tempPath, written.size)
+    trace(log, { side: "server", step: "put", status: "succeed", detail: { sha256: written.hash, size: written.size } })
     sendJson(res, 200, { sha256: written.hash, size: written.size })
   } catch (error) {
     storage.discardBlob(tempPath)
     if (res.headersSent || res.writableEnded) return
+    const status = isPredicted(error) ? "failed" : "error"
+    trace(log, { side: "server", step: "put", status, error: messageOf(error) })
     sendJson(res, 200, {
-      status: isPredicted(error) ? "failed" : "error",
+      status,
       error: messageOf(error),
     })
   }
 }
 
-async function handlePost(req, storage, callbacks, currentSubject, wake) {
+async function handlePost(req, storage, callbacks, currentSubject, wake, log) {
   const body = await readJson(req)
   if (body === null || typeof body !== "object" || Array.isArray(body)) {
     throw new TypeError("request must be an object")
@@ -195,6 +218,7 @@ async function handlePost(req, storage, callbacks, currentSubject, wake) {
     ? subject
     : requireSubject(await currentSubject(req))
   if (live !== subject) {
+    trace(log, { side: "server", subject: live, step: "ack", status: "switched" })
     return { status: 409, body: emptyAck("switched", live) }
   }
   if (!callbacks.has(subject)) throw new Error(`subject is not initialized: ${subject}`)
@@ -202,10 +226,16 @@ async function handlePost(req, storage, callbacks, currentSubject, wake) {
   const failures = receiveFailureList(body.receiveFailed)
   if (failures.length > 0 && !clientId) throw new TypeError("clientId is required")
   const pointer = requirePointer(body.pointer)
+  trace(log, {
+    side: "server",
+    subject,
+    step: "post",
+    detail: { pointer, ids: changesOf(body).map((change) => change?.id), clientId },
+  })
 
   const skipped = []
   for (const failure of failures) {
-    const noted = noteReceiveFailure(storage, subject, clientId, failure)
+    const noted = noteReceiveFailure(storage, subject, clientId, failure, log)
     if (noted) skipped.push(noted)
   }
 
@@ -217,7 +247,10 @@ async function handlePost(req, storage, callbacks, currentSubject, wake) {
   for (const change of changes) {
     try {
       const stored = acceptChange(storage, subject, change)
-      if (stored.enqueued) enqueued = true
+      if (stored.enqueued) {
+        enqueued = true
+        trace(log, { side: "server", subject, step: "enqueue", id: stored.id, detail: { position: stored.position } })
+      }
       acceptedIds.push(stored.id)
     } catch (error) {
       if (!isPredicted(error)) throw error
@@ -234,6 +267,16 @@ async function handlePost(req, storage, callbacks, currentSubject, wake) {
     if (!seen.has(item.id)) skipped.push(item)
   }
   if (enqueued) wake()
+
+  const statusName = failure ? (acceptedIds.length > 0 ? "partial" : "failed") : "succeed"
+  trace(log, {
+    side: "server",
+    subject,
+    step: "ack",
+    status: statusName,
+    error: failure ? failure.message : undefined,
+    detail: { acceptedIds },
+  })
 
   return {
     status: 200,
@@ -257,22 +300,32 @@ function acceptChange(storage, subject, change) {
   for (const manifest of packageValue.attachments) {
     try {
       storage.requireBlob(manifest.sha256, manifest.size)
-    } catch {
-      throw new Error(`attachment verification failed for ${manifest.id}`)
+    } catch (error) {
+      if (!isAttachmentCheck(error)) throw error
+      throw attachmentFailure(error, manifest.id)
     }
   }
   const result = storage.appendEntry(subject, change.id, packageValue)
   if (result.duplicate) return { id: change.id, enqueued: false }
   storage.enqueueUnprocessed(subject, result.position, change.id, packageValue)
-  return { id: change.id, enqueued: true }
+  return { id: change.id, position: result.position, enqueued: true }
 }
 
-function noteReceiveFailure(storage, subject, clientId, failure) {
+function noteReceiveFailure(storage, subject, clientId, failure, log) {
   const existing = storage.sendFailure(subject, clientId, failure.id)
   if (existing) return { id: existing.id, position: existing.position }
   const entry = storage.entryById(subject, failure.id)
   if (!entry) return null
   const attempts = storage.incrementSendAttempts(subject, clientId, failure.id)
+  trace(log, {
+    side: "server",
+    subject,
+    step: attempts < ATTEMPT_LIMIT ? "send" : "send-failed",
+    id: failure.id,
+    attempt: attempts,
+    error: failure.error,
+    detail: { clientId },
+  })
   if (attempts < ATTEMPT_LIMIT) return null
   storage.recordFailure({
     subject,
@@ -307,7 +360,11 @@ function deliveryFor(storage, subject, pointer, clientId) {
   return { skipped, entries }
 }
 
-async function handleGet(req, res, storage, callbacks, currentSubject, query) {
+function changesOf(body) {
+  return Array.isArray(body.changes) ? body.changes : []
+}
+
+async function handleGet(req, res, storage, callbacks, currentSubject, query, log) {
   const expected = requireSha256(query)
   const blob = storage.openBlob(expected)
   if (blob) {
@@ -315,10 +372,12 @@ async function handleGet(req, res, storage, callbacks, currentSubject, query) {
       "Content-Type": "application/octet-stream",
       "Content-Length": blob.size,
     })
+    trace(log, { side: "server", step: "get", status: "succeed", detail: { sha256: expected, size: blob.size } })
     await pipeline(createReadStream(blob.file), res)
     return
   }
   if (currentSubject === undefined) {
+    trace(log, { side: "server", step: "get", status: "failed", detail: { sha256: expected } })
     res.writeHead(404)
     res.end()
     return
@@ -327,6 +386,7 @@ async function handleGet(req, res, storage, callbacks, currentSubject, query) {
   const registered = callbacks.get(live)
   const manifest = storage.findAttachment(live, expected)
   if (!registered?.readAttachment || !manifest) {
+    trace(log, { side: "server", subject: live, step: "get", status: "failed", detail: { sha256: expected } })
     res.writeHead(404)
     res.end()
     return
@@ -336,15 +396,27 @@ async function handleGet(req, res, storage, callbacks, currentSubject, query) {
     bytes = asBytes(await registered.readAttachment(manifest), "attachment")
   } catch (error) {
     if (isMissing(error)) {
+      trace(log, { side: "server", subject: live, step: "get", status: "failed", error: messageOf(error), detail: { sha256: expected } })
       res.writeHead(404)
       res.end()
       return
     }
     throw error
   }
-  if (sha256(bytes) !== manifest.sha256 || bytes.byteLength !== manifest.size) {
-    throw new Error(`attachment verification failed for ${manifest.id}`)
+  const actualHash = sha256(bytes)
+  if (actualHash !== manifest.sha256) {
+    throw attachmentError(
+      "ATTACHMENT_HASH_MISMATCH",
+      `ATTACHMENT_HASH_MISMATCH sha256 ${manifest.sha256} actual ${actualHash} attachment ${manifest.id}`,
+    )
   }
+  if (bytes.byteLength !== manifest.size) {
+    throw attachmentError(
+      "ATTACHMENT_SIZE_MISMATCH",
+      `ATTACHMENT_SIZE_MISMATCH sha256 ${manifest.sha256} expected ${manifest.size} actual ${bytes.byteLength} attachment ${manifest.id}`,
+    )
+  }
+  trace(log, { side: "server", subject: live, step: "get", status: "succeed", detail: { sha256: expected, size: bytes.byteLength } })
   res.writeHead(200, {
     "Content-Type": "application/octet-stream",
     "Content-Length": bytes.byteLength,
@@ -412,10 +484,28 @@ function isMissing(error) {
   return error instanceof Error && /missing/i.test(error.message)
 }
 
+function isAttachmentCheck(error) {
+  return error instanceof Error && (
+    error.code === "ATTACHMENT_NOT_FOUND"
+    || error.code === "ATTACHMENT_SIZE_MISMATCH"
+    || error.code === "ATTACHMENT_HASH_MISMATCH"
+  )
+}
+
+function attachmentFailure(error, id) {
+  return attachmentError(error.code, `${error.message} attachment ${id}`)
+}
+
+function attachmentError(code, message) {
+  const error = new Error(message)
+  error.code = code
+  return error
+}
+
 function isPredicted(error) {
   if (error instanceof TypeError) return true
   if (!(error instanceof Error)) return false
-  return /attachment verification failed|attachment hash|attachment cache|must be|invalid|required/.test(error.message)
+  return /attachment verification failed|attachment hash|attachment cache|ATTACHMENT_NOT_FOUND|ATTACHMENT_SIZE_MISMATCH|ATTACHMENT_HASH_MISMATCH|must be|invalid|required/.test(error.message)
 }
 
 function messageOf(error) {

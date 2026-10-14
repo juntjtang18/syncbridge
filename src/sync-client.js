@@ -5,15 +5,18 @@ import {
   requireReadAttachment,
   requireSubject,
 } from "./client-contracts.js"
+import { createLog, trace } from "./log.js"
 
 const ATTEMPT_LIMIT = 3
 
-export function createClient({ storage, transport, sha256, randomId }) {
+export function createClient({ storage, transport, sha256, randomId, log }) {
   if (typeof sha256 !== "function") throw new TypeError("sha256 must be a function")
   if (typeof randomId !== "function") throw new TypeError("randomId must be a function")
 
   const applyBySubject = new Map()
   const readBySubject = new Map()
+  const subjectByDigest = new Map()
+  const sink = createLog(log)
   let subject
   let digest
   let applyChange
@@ -56,6 +59,9 @@ export function createClient({ storage, transport, sha256, randomId }) {
   }
 
   async function applyUnprocessed(targetDigest, row, callback) {
+    const loggedSubject = subjectByDigest.get(targetDigest)
+    const attempt = (row.attempts || 0) + 1
+    trace(sink, { side: "client", subject: loggedSubject, step: "apply", id: row.id, attempt, detail: { position: row.position } })
     try {
       const applied = await callback(
         { id: row.id, position: row.position, package: row.package },
@@ -80,8 +86,17 @@ export function createClient({ storage, transport, sha256, randomId }) {
         if (manifest.sha256) await storage.dropBlob(targetDigest, manifest.sha256)
       }
       await removeUnprocessed(targetDigest, row.id)
+      trace(sink, { side: "client", subject: loggedSubject, step: "applied", id: row.id, attempt })
     } catch (error) {
       const attempts = (row.attempts || 0) + 1
+      trace(sink, {
+        side: "client",
+        subject: loggedSubject,
+        step: "apply-failed",
+        id: row.id,
+        attempt: attempts,
+        error: messageOf(error),
+      })
       if (attempts < ATTEMPT_LIMIT) {
         const current = await withQueue(async () => {
           const rows = await storage.readUnprocessed(targetDigest)
@@ -132,6 +147,7 @@ export function createClient({ storage, transport, sha256, randomId }) {
     const callback = requireApplyChange(nextApplyChange)
     const reader = requireReadAttachment(options?.readAttachment)
     const nextDigest = await storage.initSubject(key)
+    subjectByDigest.set(nextDigest, key)
     applyBySubject.set(key, callback)
     if (reader) readBySubject.set(key, reader)
     else readBySubject.delete(key)
@@ -201,6 +217,7 @@ export function createClient({ storage, transport, sha256, randomId }) {
         const prepared = preparePackage(input)
         const record = { id: randomId(), package: prepared.package, attempts: 0 }
         await storage.appendOutbox(digest, record)
+        trace(sink, { side: "client", subject, step: "append", id: record.id })
         return { id: record.id }
       })
     },
@@ -216,25 +233,46 @@ export function createClient({ storage, transport, sha256, randomId }) {
           if (batch.length === 0 && pulled) return { status: "succeed", subject }
           if (batch.length > 0) {
             try {
-              await fillHashes(batch, readAttachment, transport)
+              await fillHashes(batch, readAttachment, transport, sink, subject)
               await storage.writeOutbox(digest, replaceBatch(all, batch))
             } catch (error) {
-              const capped = await failSend(storage, digest, batch[0], messageOf(error))
+              trace(sink, { side: "client", subject, step: "put", id: batch[0]?.id, status: "failed", error: messageOf(error) })
+              const capped = await failSend(storage, digest, batch[0], messageOf(error), sink, subject)
               if (!capped) return { status: "failed", subject, error: messageOf(error) }
               continue
             }
           }
           const pointer = await storage.readPointer(digest)
-          const response = await transport.post({
+          trace(sink, {
+            side: "client",
             subject,
-            pointer,
-            changes: batch,
-            clientId,
+            step: "post",
+            detail: { pointer, ids: batch.map((row) => row.id) },
           })
+          let response
+          try {
+            response = await transport.post({
+              subject,
+              pointer,
+              changes: batch,
+              clientId,
+            })
+          } catch (error) {
+            trace(sink, { side: "client", subject, step: "error", error: messageOf(error) })
+            throw error
+          }
           pulled = true
+          trace(sink, {
+            side: "client",
+            subject: response?.subject,
+            step: "ack",
+            status: response?.status,
+            error: response?.error,
+            detail: { acceptedIds: response?.acceptedIds },
+          })
           if ((response?.status === "failed" || response?.status === "error") && !response.subject) {
             if (batch[0]) {
-              const capped = await failSend(storage, digest, batch[0], response.error || response.status)
+              const capped = await failSend(storage, digest, batch[0], response.error || response.status, sink, subject)
               if (!capped) return { status: response.status, error: response.error }
               continue
             }
@@ -261,7 +299,7 @@ export function createClient({ storage, transport, sha256, randomId }) {
           }
           await storage.removeOutbox(digest, response.acceptedIds)
           await ingest(response, {
-            storage, transport, digest, clientId, subject, withQueue,
+            storage, transport, digest, clientId, subject, withQueue, log: sink,
             wake: () => wake(digest, applyChange),
             post: (body) => transport.post(body),
           })
@@ -272,7 +310,7 @@ export function createClient({ storage, transport, sha256, randomId }) {
               if (left.length === 0) return { status: "succeed", subject }
               return { status: response.status, subject, error: response.error }
             }
-            const capped = await failSend(storage, digest, rejected, response.error || response.status)
+            const capped = await failSend(storage, digest, rejected, response.error || response.status, sink, subject)
             if (!capped) return { status: response.status, subject, error: response.error }
             continue
           }
@@ -354,7 +392,7 @@ function replaceBatch(all, batch) {
   return all.map((row) => byId.get(row.id) || row)
 }
 
-async function failSend(storage, digest, record, detail) {
+async function failSend(storage, digest, record, detail, log, subject) {
   if (!record) return false
   const all = await storage.readOutbox(digest)
   const index = all.findIndex((row) => row.id === record.id)
@@ -363,6 +401,7 @@ async function failSend(storage, digest, record, detail) {
   if (attempts < ATTEMPT_LIMIT) {
     all[index] = { ...all[index], attempts }
     await storage.writeOutbox(digest, all)
+    trace(log, { side: "client", subject, step: "send", id: record.id, attempt: attempts, error: detail })
     return false
   }
   const failures = await storage.readFailures(digest)
@@ -374,6 +413,14 @@ async function failSend(storage, digest, record, detail) {
   })
   await storage.writeFailures(digest, failures)
   await storage.removeOutbox(digest, [record.id])
+  trace(log, {
+    side: "client",
+    subject,
+    step: "send-failed",
+    id: record.id,
+    attempt: attempts,
+    error: `send failed after 3 attempts: ${detail}`,
+  })
   return true
 }
 
@@ -391,12 +438,26 @@ async function ingest(response, context) {
     try {
       await saveReceived(context, entry)
       await context.storage.writePointer(context.digest, entry.position)
+      trace(context.log, {
+        side: "client",
+        subject: context.subject,
+        step: "pointer",
+        id: entry.id,
+        detail: { position: entry.position },
+      })
       context.wake()
       entries = entries.slice(1)
       guard = 0
     } catch (error) {
       guard += 1
       if (guard > 12) throw new Error("receive retry did not advance")
+      trace(context.log, {
+        side: "client",
+        subject: context.subject,
+        step: "receive-failed",
+        id: entry.id,
+        error: messageOf(error),
+      })
       const ack = await context.post({
         subject: context.subject,
         pointer,
@@ -412,7 +473,16 @@ async function ingest(response, context) {
       const skip = Array.isArray(ack.skipped) ? ack.skipped.find((item) => item.id === entry.id) : null
       if (skip && Number.isInteger(skip.position)) {
         const current = await context.storage.readPointer(context.digest)
-        if (skip.position > current) await context.storage.writePointer(context.digest, skip.position)
+        if (skip.position > current) {
+          await context.storage.writePointer(context.digest, skip.position)
+          trace(context.log, {
+            side: "client",
+            subject: context.subject,
+            step: "skip",
+            id: entry.id,
+            detail: { position: skip.position },
+          })
+        }
       }
       entries = Array.isArray(ack.entries) ? ack.entries : []
     }
@@ -431,7 +501,15 @@ async function saveReceived(context, entry) {
     if (rows.some((row) => row.id === entry.id)) return
     rows.push({ id: entry.id, position: entry.position, package: entry.package, attempts: 0 })
     await context.storage.writeUnprocessed(context.digest, rows)
+    trace(context.log, {
+      side: "client",
+      subject: context.subject,
+      step: "enqueue",
+      id: entry.id,
+      detail: { position: entry.position },
+    })
   })
+  trace(context.log, { side: "client", subject: context.subject, step: "save", id: entry.id })
 }
 
 async function advanceSkipped(context, skipped) {
@@ -441,7 +519,15 @@ async function advanceSkipped(context, skipped) {
     if (item && Number.isInteger(item.position) && item.position > pointer) pointer = item.position
   }
   const current = await context.storage.readPointer(context.digest)
-  if (pointer !== current) await context.storage.writePointer(context.digest, pointer)
+  if (pointer !== current) {
+    await context.storage.writePointer(context.digest, pointer)
+    trace(context.log, {
+      side: "client",
+      subject: context.subject,
+      step: "pointer",
+      detail: { position: pointer },
+    })
+  }
 }
 
 async function adoptSwitch(response, storage, state) {
@@ -460,11 +546,18 @@ async function adoptSwitch(response, storage, state) {
   return { status: "switched", switched: true, subject: live }
 }
 
-async function fillHashes(changes, readAttachment, transport) {
+async function fillHashes(changes, readAttachment, transport, log, subject) {
   for (const change of changes) {
     for (const manifest of change.package.attachments) {
       if (manifest.sha256 && Number.isInteger(manifest.size)) continue
       if (!readAttachment) throw new Error("readAttachment is required")
+      trace(log, {
+        side: "client",
+        subject,
+        step: "put",
+        id: change.id,
+        detail: { attachmentId: manifest.id, path: manifest.path },
+      })
       const uploaded = await transport.put(await readAttachment(manifest))
       if (uploaded?.status === "failed" || uploaded?.status === "error") {
         throw new Error(uploaded.error || "attachment upload failed")
@@ -474,6 +567,14 @@ async function fillHashes(changes, readAttachment, transport) {
       }
       manifest.sha256 = uploaded.sha256
       manifest.size = uploaded.size
+      trace(log, {
+        side: "client",
+        subject,
+        step: "put",
+        id: change.id,
+        status: "succeed",
+        detail: { attachmentId: manifest.id, sha256: uploaded.sha256, size: uploaded.size },
+      })
     }
   }
 }

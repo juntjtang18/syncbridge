@@ -185,6 +185,53 @@ await client.whenIdle()
 
 The host reads and replaces a queue directly. On the phone, `outbox()` and `setOutbox(records)` are the upload buffer. `unprocessed()` and `setUnprocessed(records)` are the local apply queue. `setUnprocessed` wakes the worker. On the server, `unprocessed(subject)` and `setUnprocessed(subject, records)` are that subject's apply queue. A record is `{ id, package, attempts }` for the outbox, and `{ id, position, package, attempts }` for the unprocessed queue. `package` is `{ data, attachments }`.
 
+7. Pass a `log` when the host wants a trace of each step. The host implements `{ write(event) }`. Syncbridge calls `write` and does not print the line itself. Omit `log` and the writes go nowhere. If `log` is passed, `write` must be a function. A throw inside `write` is ignored, so a broken logger cannot change the sync result. Apply lines that happen after `sync()` returns still call `write`.
+
+```js
+const lines = []
+const log = {
+  write(event) {
+    lines.push(event)
+  },
+}
+
+const syncServer = createSyncServer({
+  dataDir: serverDir,
+  currentSubject,
+  log,
+})
+
+const client = createSyncClient({
+  dataDir,
+  url: new URL("/sync", baseUrl).toString(),
+  headers() {
+    return { cookie: `session=${cookie}` }
+  },
+  log,
+})
+```
+
+Each event is `{ at, side, subject, step, id, attempt, status, error, detail }`. Fields that have no value are left out. `at` is an ISO time. `side` is `"client"` or `"server"`. `detail` has ids, counts, hashes, and sizes. It does not include attachment bytes, the session cookie, or `package.data`.
+
+| Step | When it is written |
+| --- | --- |
+| `append` | A change is queued. On the phone that is the outbox. On the server that is `appendChanges` into the log. |
+| `put` | An attachment is uploaded. `status` is `succeed`, `failed`, or `error`. |
+| `get` | The server reads attachment bytes for a download. |
+| `post` | A sync request is sent or received. `detail` has the pointer and the change ids. |
+| `ack` | The response status is known: `succeed`, `partial`, `failed`, `error`, or `switched`. |
+| `enqueue` | A saved entry is placed on the apply queue. |
+| `save` | The phone has stored a downloaded entry. |
+| `pointer` | The phone moved its pointer. |
+| `send` | A send failed and the attempt is still under 3. |
+| `send-failed` | The third send failure was recorded. |
+| `receive-failed` | The phone could not save a downloaded entry. |
+| `skip` | The sender gave up on an entry and the pointer moved past it. |
+| `apply` | `applyChange` is about to run. `attempt` is 1, 2, or 3. |
+| `applied` | `applyChange` returned. |
+| `apply-failed` | `applyChange` threw. After the third time the failure list has the row. |
+| `error` | A request threw outside the predicted failure path. |
+
 ## Usage example codes
 
 `applyChange`. You implement this function. SyncBridge calls it and does not write business data. The server passes its function to `syncServer.init`. The client passes its function to `client.use`. Each side writes into its own business storage. `entry` is `{ id, position, package }`. `attachments.get(id).read()` returns that entry's bytes. Throw if a write fails.

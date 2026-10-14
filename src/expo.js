@@ -5,7 +5,7 @@ import { createExpoClientStorage } from "./expo-client-storage.js"
 import { createFetchTransport } from "./fetch-transport.js"
 import { createClient } from "./sync-client.js"
 
-export function createSyncClient({ dataDir, url, headers }) {
+export function createSyncClient({ dataDir, url, headers, log }) {
   requireString(dataDir, "dataDir")
   requireHttpUrl(url)
   if (headers !== undefined && typeof headers !== "function") {
@@ -17,6 +17,7 @@ export function createSyncClient({ dataDir, url, headers }) {
     transport: createFetchTransport({ url, headers, fetch }),
     sha256,
     randomId,
+    log,
   })
 }
 

@@ -291,6 +291,65 @@ test("e2e: a receiver apply fails three times, then a later entry still applies"
   assert.deepEqual(server.unprocessed(subjectA), [])
 })
 
+test("e2e: a robot client records the host log for a sync and a failed apply", async (t) => {
+  const dirs = await tempDirs(t)
+  const serverLog = []
+  const robotLog = []
+  const server = createSyncServer({
+    dataDir: dirs.server,
+    log: { write(event) { serverLog.push(event) } },
+  })
+  t.after(() => server.close())
+  const endpoints = await listen(server, t)
+  server.init(subjectA, async (entry) => {
+    if (entry.package.data.poi === "poison") throw new Error("apply failed")
+  })
+  const robot = createRobotClient({
+    dataDir: dirs.client,
+    url: endpoints.url,
+    log: { write(event) { robotLog.push(event) } },
+  })
+
+  const synced = await robot.syncChange(subjectA, { poi: "north-wall" })
+  await server.whenIdle()
+  assert.equal(synced.status, "succeed")
+  assert.deepEqual(steps(robotLog), ["append", "post", "ack", "enqueue", "save", "pointer", "apply", "applied"])
+  assert.deepEqual(steps(serverLog), ["post", "enqueue", "ack", "apply", "applied"])
+  assert.equal(robotLog.find((event) => event.step === "ack").status, "succeed")
+  assert.equal(robotLog[0].side, "client")
+  assert.equal(serverLog[0].side, "server")
+  assert.equal(robotLog[0].subject, subjectA)
+
+  robotLog.length = 0
+  serverLog.length = 0
+  const failed = await robot.syncChange(subjectA, { poi: "poison" })
+  await server.whenIdle()
+  assert.equal(failed.status, "succeed")
+  const applyFailures = serverLog.filter((event) => event.step === "apply-failed")
+  assert.equal(applyFailures.length, 3)
+  assert.match(applyFailures[2].error, /apply failed/)
+  assert.equal(applyFailures[2].attempt, 3)
+  assert.ok(robotLog.some((event) => event.step === "ack" && event.status === "succeed"))
+  assert.ok(robotLog.some((event) => event.step === "applied"))
+})
+
+function createRobotClient({ dataDir, url, log }) {
+  const client = createSyncClient({ dataDir, url, log })
+  return {
+    async syncChange(subject, data) {
+      await client.use(subject, async () => {})
+      await client.appendChanges({ data })
+      const result = await client.sync()
+      await client.whenIdle()
+      return result
+    },
+  }
+}
+
+function steps(events) {
+  return events.map((event) => event.step)
+}
+
 async function pointerOf(dataDir, subject) {
   return readFile(path.join(dataDir, "subjects", subjectDigest(subject), "pointer"), "utf8")
 }

@@ -121,8 +121,12 @@ export function createAttachmentReader(manifests, readBytes, digest) {
         async read() {
           const bytes = asBytes(await readBytes(manifest), "attachment")
           if (manifest.sha256 && typeof digest === "function") {
-            if (await digest(bytes) !== manifest.sha256 || bytes.byteLength !== manifest.size) {
-              throw new Error(`attachment verification failed for ${id}`)
+            const actualHash = await digest(bytes)
+            if (actualHash !== manifest.sha256) {
+              throw new Error(`ATTACHMENT_HASH_MISMATCH sha256 ${manifest.sha256} actual ${actualHash} attachment ${id}`)
+            }
+            if (bytes.byteLength !== manifest.size) {
+              throw new Error(`ATTACHMENT_SIZE_MISMATCH sha256 ${manifest.sha256} expected ${manifest.size} actual ${bytes.byteLength} attachment ${id}`)
             }
           }
           return bytes

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto"
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import Database from "better-sqlite3"
@@ -375,6 +375,111 @@ test("a bad change is refused twice and the third send moves it to the client fa
   assert.deepEqual(rows.map((row) => row.id), ["good"])
 })
 
+test("an attachment refusal names the reason, hash, size, and attachment id", async (t) => {
+  const dirs = await tempDirs(t)
+  const hash = "ab".repeat(32)
+  const storage = createNodeServerStorage(dirs.server)
+  assert.throws(
+    () => storage.requireBlob(hash, 1),
+    (error) => error.code === "ATTACHMENT_NOT_FOUND" && error.message === `ATTACHMENT_NOT_FOUND sha256 ${hash}`,
+  )
+  await mkdir(path.join(dirs.server, "blobs"), { recursive: true })
+  const stored = Buffer.from("abcd")
+  const storedHash = digestBytes(stored)
+  await writeFile(path.join(dirs.server, "blobs", storedHash), stored)
+  assert.throws(
+    () => storage.requireBlob(storedHash, 9),
+    (error) => error.code === "ATTACHMENT_SIZE_MISMATCH"
+      && error.message === `ATTACHMENT_SIZE_MISMATCH sha256 ${storedHash} expected 9 actual 4`,
+  )
+  storage.close()
+
+  const serverLog = []
+  const clientLog = []
+  const server = createSyncServer({
+    dataDir: dirs.server,
+    log: { write(event) { serverLog.push(event) } },
+  })
+  t.after(() => server.close())
+  const endpoints = await listen(server, t)
+  server.init(subject, async () => {})
+  const client = createSyncClient({
+    dataDir: dirs.client,
+    url: endpoints.url,
+    log: { write(event) { clientLog.push(event) } },
+  })
+  await client.init(subject, async () => {})
+  await client.setOutbox([{
+    id: "missing-file",
+    attempts: 0,
+    package: {
+      data: "missing",
+      attachments: [{ id: "photo-1", path: "photo-1.jpg", sha256: hash, size: 1 }],
+    },
+  }])
+  const missing = await client.sync()
+  assert.equal(missing.status, "failed")
+  const missingText = `ATTACHMENT_NOT_FOUND sha256 ${hash} attachment photo-1`
+  assert.equal(missing.error, missingText)
+  assert.equal(serverLog.find((event) => event.step === "ack").error, missingText)
+  assert.equal(clientLog.find((event) => event.step === "ack").error, missingText)
+
+  const uploaded = await fetch(endpoints.url, {
+    method: "PUT",
+    headers: { "content-type": "application/octet-stream" },
+    body: stored,
+  })
+  assert.equal(uploaded.status, 200)
+  serverLog.length = 0
+  clientLog.length = 0
+  await client.setOutbox([{
+    id: "wrong-size",
+    attempts: 0,
+    package: {
+      data: "wrong-size",
+      attachments: [{ id: "photo-1", path: "photo-1.jpg", sha256: storedHash, size: 9 }],
+    },
+  }])
+  const mismatched = await client.sync()
+  const mismatchText = `ATTACHMENT_SIZE_MISMATCH sha256 ${storedHash} expected 9 actual 4 attachment photo-1`
+  assert.equal(mismatched.status, "failed")
+  assert.equal(mismatched.error, mismatchText)
+  assert.equal(serverLog.find((event) => event.step === "ack").error, mismatchText)
+  assert.equal(clientLog.find((event) => event.step === "ack").error, mismatchText)
+})
+
+test("a disk error while checking an attachment keeps its own message", async (t) => {
+  const dirs = await tempDirs(t)
+  const storage = createNodeServerStorage(dirs.server)
+  storage.requireBlob = () => {
+    const error = new Error("EACCES: permission denied, stat '/blobs/photo'")
+    error.code = "EACCES"
+    throw error
+  }
+  const serverLog = []
+  const server = createServer({
+    storage,
+    log: { write(event) { serverLog.push(event) } },
+  })
+  t.after(() => server.close())
+  const endpoints = await listen(server, t)
+  server.init(subject, async () => {})
+  const client = createSyncClient({ dataDir: dirs.client, url: endpoints.url })
+  await client.init(subject, async () => {})
+  await client.setOutbox([{
+    id: "disk",
+    attempts: 0,
+    package: {
+      data: "disk",
+      attachments: [{ id: "photo-1", path: "photo-1.jpg", sha256: "ab".repeat(32), size: 1 }],
+    },
+  }])
+  const failed = await client.sync()
+  assert.equal(failed.status, "error")
+  assert.equal(failed.error, "EACCES: permission denied, stat '/blobs/photo'")
+  assert.equal(serverLog.find((event) => event.step === "error").error, failed.error)
+})
+
 test("a download failure is retried by the server and then skipped for that client only", async (t) => {
   const dirs = await tempDirs(t)
   const photo = Buffer.from("photo-bytes")
@@ -480,6 +585,40 @@ test("an unexpected storage throw is an error ack and the next sync still succee
   const synced = await client.sync()
   assert.equal(synced.status, "succeed")
   await server.whenIdle()
+})
+
+test("a host log receives each sync step and a missing log writes nowhere", async (t) => {
+  const dirs = await tempDirs(t)
+  const serverEvents = []
+  const clientEvents = []
+  const server = createSyncServer({
+    dataDir: dirs.server,
+    log: { write(event) { serverEvents.push(event) } },
+  })
+  t.after(() => server.close())
+  const endpoints = await listen(server, t)
+  server.init(subject, async () => {})
+  const client = createSyncClient({
+    dataDir: dirs.client,
+    url: endpoints.url,
+    log: {
+      write(event) {
+        if (event.step === "ack") throw new Error("host log failed")
+        clientEvents.push(event)
+      },
+    },
+  })
+  await client.init(subject, async () => {})
+  await client.appendChanges({ data: "visible" })
+  const synced = await client.sync()
+  await server.whenIdle()
+  await client.whenIdle()
+  assert.equal(synced.status, "succeed")
+  assert.deepEqual(clientEvents.map((event) => event.step), ["append", "post", "enqueue", "save", "pointer", "apply", "applied"])
+  assert.deepEqual(serverEvents.map((event) => event.step), ["post", "enqueue", "ack", "apply", "applied"])
+  assert.equal(serverEvents[0].side, "server")
+  assert.equal(clientEvents[0].side, "client")
+  assert.equal(typeof clientEvents[0].at, "string")
 })
 
 async function tempDirs(t) {

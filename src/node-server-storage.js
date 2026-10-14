@@ -302,15 +302,21 @@ export function createNodeServerStorage(dataDir) {
     },
 
     requireBlob(expectedHash, size) {
-      const file = blobFile(expectedHash)
+      const hash = requireHash(expectedHash)
+      const file = blobFile(hash)
       let info
       try {
         info = statSync(file)
       } catch (error) {
-        if (error.code === "ENOENT") throw new Error("attachment verification failed")
+        if (error.code === "ENOENT") throw attachmentError("ATTACHMENT_NOT_FOUND", `ATTACHMENT_NOT_FOUND sha256 ${hash}`)
         throw error
       }
-      if (info.size !== size) throw new Error("attachment verification failed")
+      if (info.size !== size) {
+        throw attachmentError(
+          "ATTACHMENT_SIZE_MISMATCH",
+          `ATTACHMENT_SIZE_MISMATCH sha256 ${hash} expected ${size} actual ${info.size}`,
+        )
+      }
     },
 
     openBlob(expectedHash) {
@@ -340,4 +346,10 @@ export function createNodeServerStorage(dataDir) {
 function requireHash(hash) {
   if (!/^[0-9a-f]{64}$/.test(hash)) throw new TypeError("sha256 is invalid")
   return hash
+}
+
+function attachmentError(code, message) {
+  const error = new Error(message)
+  error.code = code
+  return error
 }

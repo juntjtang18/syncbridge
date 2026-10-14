@@ -5,7 +5,7 @@ import { createNodeServerStorage } from "./node-server-storage.js"
 import { createClient } from "./sync-client.js"
 import { createServer } from "./sync-server.js"
 
-export function createSyncClient({ dataDir, url, headers }) {
+export function createSyncClient({ dataDir, url, headers, log }) {
   requireDataDir(dataDir)
   requireUrl(url)
   if (headers !== undefined && typeof headers !== "function") {
@@ -16,10 +16,11 @@ export function createSyncClient({ dataDir, url, headers }) {
     transport: createHttpTransport({ url, headers }),
     sha256,
     randomId,
+    log,
   })
 }
 
-export function createSyncServer({ dataDir, currentSubject }) {
+export function createSyncServer({ dataDir, currentSubject, log }) {
   requireDataDir(dataDir)
-  return createServer({ storage: createNodeServerStorage(dataDir), currentSubject })
+  return createServer({ storage: createNodeServerStorage(dataDir), currentSubject, log })
 }
