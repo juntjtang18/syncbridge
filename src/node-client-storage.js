@@ -12,6 +12,8 @@ export function createNodeClientStorage(dataDir) {
       await mkdir(directory, { recursive: true })
       await writeIfMissing(path.join(directory, "pointer"), "0")
       await writeIfMissing(path.join(directory, "outbox.jsonl"), "")
+      await writeIfMissing(path.join(directory, "unprocessed.json"), "[]")
+      await writeIfMissing(path.join(directory, "failures.json"), "[]")
       await writeIfMissing(path.join(directory, "subject"), subject)
       return digest
     },
@@ -100,6 +102,7 @@ export function createNodeClientStorage(dataDir) {
         if (error.code !== "ENOENT") throw error
       }
       const temporary = path.join(path.dirname(destination), `.${expectedHash}.${randomUUID()}.tmp`)
+      await mkdir(path.dirname(destination), { recursive: true })
       await writeFile(temporary, bytes)
       await rename(temporary, destination)
     },
@@ -148,6 +151,40 @@ export function createNodeClientStorage(dataDir) {
     async readBlob(digest, expectedHash) {
       return readFile(blobPath(dataDir, digest, expectedHash))
     },
+
+    async dropBlob(digest, expectedHash) {
+      await rm(blobPath(dataDir, digest, expectedHash), { force: true })
+    },
+
+    async ensureClientId() {
+      const file = path.join(dataDir, "client-id")
+      try {
+        const text = (await readFile(file, "utf8")).trim()
+        if (text) return text
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error
+      }
+      const id = randomUUID()
+      await mkdir(dataDir, { recursive: true })
+      await writeAtomic(file, id)
+      return id
+    },
+
+    async readUnprocessed(digest) {
+      return readJsonArray(unprocessedPath(dataDir, digest))
+    },
+
+    async writeUnprocessed(digest, rows) {
+      await writeAtomic(unprocessedPath(dataDir, digest), JSON.stringify(rows))
+    },
+
+    async readFailures(digest) {
+      return readJsonArray(failuresPath(dataDir, digest))
+    },
+
+    async writeFailures(digest, rows) {
+      await writeAtomic(failuresPath(dataDir, digest), JSON.stringify(rows))
+    },
   }
 }
 
@@ -165,6 +202,25 @@ function pointerPath(dataDir, digest) {
 
 function outboxPath(dataDir, digest) {
   return path.join(subjectDirectory(dataDir, digest), "outbox.jsonl")
+}
+
+function unprocessedPath(dataDir, digest) {
+  return path.join(subjectDirectory(dataDir, digest), "unprocessed.json")
+}
+
+function failuresPath(dataDir, digest) {
+  return path.join(subjectDirectory(dataDir, digest), "failures.json")
+}
+
+async function readJsonArray(file) {
+  try {
+    const text = await readFile(file, "utf8")
+    const parsed = text ? JSON.parse(text) : []
+    return Array.isArray(parsed) ? parsed : []
+  } catch (error) {
+    if (error.code === "ENOENT") return []
+    throw error
+  }
 }
 
 function blobPath(dataDir, digest, expectedHash) {

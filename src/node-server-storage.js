@@ -20,6 +20,32 @@ export function createNodeServerStorage(dataDir) {
       subject TEXT PRIMARY KEY,
       next_position INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS unprocessed (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      subject TEXT NOT NULL,
+      position INTEGER NOT NULL,
+      id TEXT NOT NULL,
+      package_json TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      UNIQUE (subject, id)
+    );
+    CREATE TABLE IF NOT EXISTS failed_entries (
+      subject TEXT NOT NULL,
+      position INTEGER,
+      id TEXT NOT NULL,
+      client_id TEXT NOT NULL DEFAULT '',
+      kind TEXT NOT NULL,
+      error TEXT NOT NULL,
+      failed_at TEXT NOT NULL,
+      PRIMARY KEY (subject, id, client_id, kind)
+    );
+    CREATE TABLE IF NOT EXISTS send_attempts (
+      subject TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      id TEXT NOT NULL,
+      attempts INTEGER NOT NULL,
+      PRIMARY KEY (subject, client_id, id)
+    );
   `)
 
   const selectById = db.prepare("SELECT position FROM log_entries WHERE subject = ? AND id = ?")
@@ -44,6 +70,59 @@ export function createNodeServerStorage(dataDir) {
     FROM log_entries
     WHERE subject = ?
     ORDER BY position DESC
+  `)
+  const selectEntryById = db.prepare(`
+    SELECT id, position, package_json
+    FROM log_entries
+    WHERE subject = ? AND id = ?
+  `)
+  const insertUnprocessed = db.prepare(`
+    INSERT OR IGNORE INTO unprocessed (subject, position, id, package_json, attempts)
+    VALUES (?, ?, ?, ?, 0)
+  `)
+  const selectUnprocessedBySubject = db.prepare(`
+    SELECT position, id, package_json, attempts
+    FROM unprocessed
+    WHERE subject = ?
+    ORDER BY seq ASC
+  `)
+  const deleteUnprocessedSubject = db.prepare("DELETE FROM unprocessed WHERE subject = ?")
+  const insertUnprocessedRow = db.prepare(`
+    INSERT INTO unprocessed (subject, position, id, package_json, attempts)
+    VALUES (?, ?, ?, ?, ?)
+  `)
+  const selectHead = db.prepare(`
+    SELECT subject, position, id, package_json, attempts
+    FROM unprocessed
+    ORDER BY seq ASC
+    LIMIT 1
+  `)
+  const selectUnprocessedCount = db.prepare("SELECT COUNT(*) AS count FROM unprocessed")
+  const updateAttempts = db.prepare("UPDATE unprocessed SET attempts = ? WHERE subject = ? AND id = ?")
+  const deleteUnprocessed = db.prepare("DELETE FROM unprocessed WHERE subject = ? AND id = ?")
+  const insertFailure = db.prepare(`
+    INSERT OR REPLACE INTO failed_entries (subject, position, id, client_id, kind, error, failed_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `)
+  const selectFailures = db.prepare(`
+    SELECT position, id, client_id, kind, error, failed_at
+    FROM failed_entries
+    WHERE subject = ?
+    ORDER BY failed_at ASC, id ASC
+  `)
+  const selectSendFailure = db.prepare(`
+    SELECT position, id
+    FROM failed_entries
+    WHERE subject = ? AND id = ? AND client_id = ? AND kind = 'send'
+  `)
+  const selectSendAttempt = db.prepare(`
+    SELECT attempts FROM send_attempts WHERE subject = ? AND client_id = ? AND id = ?
+  `)
+  const insertSendAttempt = db.prepare(`
+    INSERT INTO send_attempts (subject, client_id, id, attempts) VALUES (?, ?, ?, ?)
+  `)
+  const updateSendAttempt = db.prepare(`
+    UPDATE send_attempts SET attempts = ? WHERE subject = ? AND client_id = ? AND id = ?
   `)
 
   const append = db.transaction((subject, id, packageValue) => {
@@ -112,6 +191,90 @@ export function createNodeServerStorage(dataDir) {
 
     removeTip(subject, id, position) {
       removeTip(subject, id, position)
+    },
+
+    entryById(subject, id) {
+      const row = selectEntryById.get(subject, id)
+      if (!row) return null
+      return { id: row.id, position: row.position, package: JSON.parse(row.package_json) }
+    },
+
+    enqueueUnprocessed(subject, position, id, packageValue) {
+      insertUnprocessed.run(subject, position, id, JSON.stringify(packageValue))
+    },
+
+    listUnprocessed(subject) {
+      return selectUnprocessedBySubject.all(subject).map((row) => ({
+        id: row.id,
+        position: row.position,
+        package: JSON.parse(row.package_json),
+        attempts: row.attempts,
+      }))
+    },
+
+    replaceUnprocessed(subject, rows) {
+      const replace = db.transaction((items) => {
+        deleteUnprocessedSubject.run(subject)
+        for (const row of items) {
+          insertUnprocessedRow.run(subject, row.position, row.id, JSON.stringify(row.package), row.attempts)
+        }
+      })
+      replace(rows)
+    },
+
+    headUnprocessed() {
+      const row = selectHead.get()
+      if (!row) return null
+      return {
+        subject: row.subject,
+        position: row.position,
+        id: row.id,
+        package: JSON.parse(row.package_json),
+        attempts: row.attempts,
+      }
+    },
+
+    hasUnprocessed() {
+      return selectUnprocessedCount.get().count > 0
+    },
+
+    setUnprocessedAttempts(subject, id, attempts) {
+      updateAttempts.run(attempts, subject, id)
+    },
+
+    removeUnprocessed(subject, id) {
+      deleteUnprocessed.run(subject, id)
+    },
+
+    recordFailure({ subject, position, id, clientId, kind, error, failedAt }) {
+      insertFailure.run(subject, position ?? null, id, clientId || "", kind, error, failedAt)
+    },
+
+    failedEntries(subject) {
+      return selectFailures.all(subject).map((row) => ({
+        id: row.id,
+        position: row.position,
+        clientId: row.client_id || null,
+        kind: row.kind,
+        error: row.error,
+        failedAt: row.failed_at,
+      }))
+    },
+
+    sendFailure(subject, clientId, id) {
+      return selectSendFailure.get(subject, id, clientId) || null
+    },
+
+    sendAttempts(subject, clientId, id) {
+      return selectSendAttempt.get(subject, clientId, id)?.attempts || 0
+    },
+
+    incrementSendAttempts(subject, clientId, id) {
+      const current = selectSendAttempt.get(subject, clientId, id)
+      const next = current ? current.attempts + 1 : 1
+      if (current) updateSendAttempt.run(next, subject, clientId, id)
+      else insertSendAttempt.run(subject, clientId, id, next)
+      return next
     },
 
     beginBlob() {

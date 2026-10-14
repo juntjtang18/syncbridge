@@ -65,7 +65,7 @@ flowchart LR
 
 ## Usage tutorial
 
-1. Install SyncBridge from git in the host project and in the client project. Both import `syncbridge/node` after that.
+The phone follows this sequence. The host web server is the other end of the same calls. Install the same package in both projects. The phone imports `syncbridge/expo`. The host imports `syncbridge/node`.
 
 ```sh
 npm install github:juntjtang18/syncbridge
@@ -77,63 +77,113 @@ npm install github:juntjtang18/syncbridge
 }
 ```
 
-2. Create the server with a persistent directory. The host listens and binds `syncServer.handle(req, res)` to a path it chooses. The sample path below is `/sync`. Create the client with its own persistent directory and the full endpoint URL, including that path: `createSyncClient({ dataDir, url })`. An optional `headers` function can add the host session to each request.
-
-3. Implement the `applyChange` callback. SyncBridge does not write business data. You write this function, and you pass it to server `init` and client `use`. The server and the client each get their own function. `applyChange` is per subject.
-
-On the server, pass it to `syncServer.init(subject, applyChange, { readAttachment })` once for each subject. SyncBridge calls `applyChange` when a client change is accepted. Write `entry.package.data` and the attachment bytes into server business storage, then return. Return `{ attachments: [{ id, path }] }` when the stored path differs from the sender's path. Throw if the write fails. `readAttachment(manifest)` streams that stored path after the PUT temp is gone.
+1. On the host, create the server and bind `handle` to the path the phone will call. This example uses `/sync`. `currentSubject(req)` returns the live subject for the signed-in user.
 
 ```js
+import http from "node:http"
+import { createSyncServer } from "syncbridge/node"
+
 const syncServer = createSyncServer({ dataDir: serverDir, currentSubject })
 syncServer.init(subject, async (entry, attachments) => {
   const photo = attachments.get("photo-1")
-  const bytes = await photo.read()
-  // Your code: store entry.package.data and bytes in server business storage.
-  // Throw if that store fails.
+  const bytes = photo ? await photo.read() : null
+  // Store entry.package.data and bytes in server business storage.
+  // Return the stored path when it differs from the sender's path.
   return { attachments: [{ id: "photo-1", path: storedPath }] }
 }, { readAttachment })
+
+http.createServer((req, res) => {
+  const url = new URL(req.url, "http://localhost")
+  if (url.pathname === "/sync") {
+    syncServer.handle(req, res)
+    return
+  }
+}).listen(port)
 ```
 
-On the client, pass it to `client.use(subject, applyChange, { readAttachment })`. That call sets **current**. `sync()` and `appendChanges` use current only. A subject this device has never seen starts at pointer `0`. A known subject reuses its pointer. Write each entry into local business storage, then return. Throw if the write fails: the pointer stays put, and the next `sync()` tries the same entry again.
+The ack is sent after the log row and the attachment temp are saved. A worker then calls `applyChange`. Throw from that callback when the business write fails. The worker tries three times, then records `apply failed after 3 attempts: …` and continues. `await syncServer.whenIdle()` waits until that queue is empty. `syncServer.failedEntries(subject)` lists send and apply failures for that subject.
+
+2. On the phone, create one client for the signed-in user. `dataDir` is a directory that survives app restarts, such as a folder under the app document directory. `url` is the full endpoint, including `/sync`. `headers` sends the host session on every request.
 
 ```js
+import { createSyncClient } from "syncbridge/expo"
+
 const client = createSyncClient({
-  dataDir: clientDir,
-  url: "http://127.0.0.1:3000/sync",
+  dataDir,
+  url: new URL("/sync", baseUrl).toString(),
+  headers() {
+    return { cookie: `session=${cookie}` }
+  },
 })
-
-await client.use(subject, async (entry, attachments) => {
-  const photo = attachments.get("photo-1")
-  const bytes = await photo.read()
-  // Your code: store entry.package.data and bytes in local business storage.
-  // Throw if that store fails.
-}, { readAttachment })
 ```
 
-4. `subject` is one opaque string. The application composes and escapes it. SyncBridge stores and compares that string and does not parse tenant, driver, or folder meaning. When the configured root can change, the application includes that root in the string (`user.{id}.{driver}.{root}`). One subject is one server `changelog0`. The client persists every subject it has seen, plus which one is current.
+3. Call `init` once the user is known. `init` and `use` are the same call. It sets the current subject. `sync()` and `appendChanges` use that subject only. A subject this phone has never seen starts at pointer `0`. A known subject reuses its pointer.
+
+`applyChange` writes a downloaded entry into local business storage. `attachments.get(id).read()` returns the temp saved during `sync()`. Throw if that local write fails. The pointer stays where the save put it. After three throws the entry is on `failedEntries()` with `apply failed after 3 attempts: …`, and later entries still apply.
+
+`readAttachment` reads a local file when this phone sends it. `manifest.path` is the path passed to `appendChanges`.
 
 ```js
-"default"
-"tenant.company-123"
-"tenant.company-123.seat.mail%40example%2Ecom"
+await client.init(subject, async (entry, attachments) => {
+  const photo = attachments.get("photo-1")
+  const bytes = photo ? await photo.read() : null
+  // Store entry.package.data and bytes in local business storage.
+}, {
+  async readAttachment(manifest) {
+    // Read the file at manifest.path and return its bytes.
+  },
+})
+```
+
+4. Use the same subject string the host uses for that user. SyncBridge stores and compares the string. It does not parse it. One subject is one server log.
+
+```js
+"user.4"
 "user.4.google.1AbCfolderId"
 ```
 
-5. After the app writes a local business change, call `appendChanges(package)`. This stores the change and an attachment `path` in the client retry queue. A network connection is not required. SyncBridge does not copy the file.
+5. After the phone writes a local business change, call `appendChanges`. This queues the change. A network connection is not required. SyncBridge does not copy the file. It reads `path` later through `readAttachment`.
 
-6. A package is `{ data, attachments }`. `data` is a string or any JSON value. Each attachment at append time is `{ id, path, contentType }`. `path` is a host pointer. `sync()` streams it through `readAttachment`. The server hashes the PUT stream and stores `{ id, sha256, size, contentType, path }` in the log. It does not look inside `data`.
+```js
+await client.appendChanges({
+  data: {
+    object: "project",
+    action: "add",
+    id: "north-warehouse",
+    name: "North warehouse",
+  },
+  attachments: [
+    { id: "photo-1", path: photoPath, contentType: "image/jpeg" },
+  ],
+})
+```
 
-7. Call `sync()` when the network is available or when the user refreshes. SyncBridge does not poll. `sync()` PUTs attachment streams, posts the queued changes, then calls `applyChange` for each server entry after the saved pointer. The pointer advances only after `applyChange` succeeds. Staging files are deleted after a successful apply.
+`data` is a string or any JSON value. Each attachment is `{ id, path, contentType }`.
 
-8. On the server, `handle` branches on the method and the parameters. The host path stays `/sync` in this example only because the host bound it there.
+6. Call `sync()` when the network is available, when the app becomes active, or when the user refreshes. SyncBridge does not poll. `sync()` uploads the outbox, waits for the ack, and saves each downloaded entry and its attachment bytes. It returns before `applyChange` runs on either side.
 
-- `PUT /sync` streams the body, hashes each chunk, and responds `{ sha256, size }`. The temp file lasts only until `applyChange` succeeds.
-- `POST /sync` reads `{ subject, pointer, changes }`. The host names the live subject. If the request subject is not live, the host rejects and still returns `{ subject }`. If it is live, SyncServer appends each new change, calls `applyChange`, then deletes the PUT temp. The response is `{ acceptedIds, entries, attachmentHashes, subject }`. The client compares `subject` to the one it sent and `use`s the live string if they differ. The same change id is accepted once.
-- `GET /sync?sha256=ab12...` streams the in-flight PUT temp. After that temp is deleted, it streams `readAttachment` for the live subject's log manifest with that hash. The changelog stores `path`, not a URL.
+```js
+const result = await client.sync()
+if (result.status === "failed" || result.status === "partial" || result.status === "error") {
+  throw new Error(result.error || "Synchronization failed.")
+}
+```
 
-9. On the server, during the upload, `attachments.get(id).read()` returns the PUT temp. On the client, `attachments.get(id).read()` for a received entry downloads `GET /sync?sha256=`. Throw from `applyChange` if the business write fails. The client pointer stays put, and a failed server apply removes the new log tip so the same change id can be tried again.
+Treat the return like this:
 
-10. The server stores no pointer for any client. A BizServer change that is already in business storage is appended with `appendChanges(subject, package)` and is not applied again.
+- `succeed` means the outbox entries that were accepted are on the server log, and downloaded entries are saved on this phone. Show synced. A send that failed three times is on this phone's failure list, and a later outbox entry sent in the same `sync()` still counts as `succeed`.
+- `failed`, `partial`, and `error` mean the attempt is still under the cap of 3. Show the error state. The next `sync()` sends that entry again.
+- `switched` means the live subject changed. `result.subject` is the new current subject. Call `init` again with that subject's `applyChange` before the next sync.
+
+A local `applyChange` failure does not change this return. The screen that reads data written by `applyChange` waits for that work:
+
+```js
+await client.whenIdle()
+```
+
+`client.failedEntries()` is the list for the current subject. Send rows say `send failed after 3 attempts: …`. Apply rows say `apply failed after 3 attempts: …`.
+
+The host reads and replaces a queue directly. On the phone, `outbox()` and `setOutbox(records)` are the upload buffer. `unprocessed()` and `setUnprocessed(records)` are the local apply queue. `setUnprocessed` wakes the worker. On the server, `unprocessed(subject)` and `setUnprocessed(subject, records)` are that subject's apply queue. A record is `{ id, package, attempts }` for the outbox, and `{ id, position, package, attempts }` for the unprocessed queue. `package` is `{ data, attachments }`.
 
 ## Usage example codes
 
@@ -158,7 +208,7 @@ async function applyChange(entry, attachments) {
 }
 
 syncServer.init(subject, applyChange, { readAttachment })
-await client.use(subject, applyChange, { readAttachment })
+await client.init(subject, applyChange, { readAttachment })
 ```
 
 Host server. The process listens. SyncBridge handles the routed request. `applyChange` is the function above.
@@ -179,21 +229,20 @@ http.createServer((req, res) => {
 }).listen(port)
 ```
 
-Client. `url` is the full endpoint the host bound.
+Phone. Import `syncbridge/expo`. A Node client uses `syncbridge/node` and the same calls.
 
 ```js
-import { createSyncClient } from "syncbridge/node"
+import { createSyncClient } from "syncbridge/expo"
 
 const client = createSyncClient({
-  dataDir: clientDir,
-  url: `http://127.0.0.1:${port}/sync`,
+  dataDir,
+  url: new URL("/sync", baseUrl).toString(),
   headers() {
-    return { cookie: sessionCookie }
+    return { cookie: `session=${cookie}` }
   },
 })
 
-await client.use(subject, applyChange)
-
+await client.init(subject, applyChange, { readAttachment })
 await client.appendChanges({
   data: {
     poi,
@@ -202,15 +251,15 @@ await client.appendChanges({
     ],
   },
   attachments: [
-    {
-      id: "photo-1",
-      path: "poi-1.jpg",
-      contentType: "image/jpeg",
-    },
+    { id: "photo-1", path: photoPath, contentType: "image/jpeg" },
   ],
 })
 
-await client.sync()
+const result = await client.sync()
+if (result.status === "failed" || result.status === "partial" || result.status === "error") {
+  throw new Error(result.error || "Synchronization failed.")
+}
+await client.whenIdle()
 ```
 
 BizServer appends a change it has already stored. This writes the log and does not call `applyChange`.

@@ -28,7 +28,18 @@ export function createFetchTransport({ url, headers, fetch }) {
         }),
         body: payload,
       })
-      return JSON.parse(await requireText(response))
+      const text = await response.text()
+      let parsed = {}
+      if (text) {
+        try {
+          parsed = JSON.parse(text)
+        } catch {
+          parsed = {}
+        }
+      }
+      if (response.status === 409 && parsed && typeof parsed.subject === "string") return parsed
+      if (!response.ok) throw errorFromText(text, parsed, response.status)
+      return parsed
     },
 
     async get(hash, dest) {
@@ -71,12 +82,17 @@ async function requireText(response) {
 
 async function errorFrom(response) {
   const text = await response.text()
-  let message
+  let parsed
   try {
-    const body = JSON.parse(text)
-    if (body && typeof body.error === "string") message = body.error
+    parsed = JSON.parse(text)
   } catch {
-    // Fall back to the response body when the host does not return JSON.
+    parsed = null
   }
-  return new Error(message || text || `request failed with status ${response.status}`)
+  return errorFromText(text, parsed, response.status)
+}
+
+function errorFromText(text, parsed, status) {
+  let message
+  if (parsed && typeof parsed.error === "string") message = parsed.error
+  return new Error(message || text || `request failed with status ${status}`)
 }

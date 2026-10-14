@@ -10,6 +10,8 @@ export function createExpoClientStorage(dataDir, { sha256, subjectDigest, random
       directory(attachmentsDirectory(digest)).create({ intermediates: true, idempotent: true })
       await writeIfMissing(pointerPath(digest), "0")
       await writeIfMissing(outboxPath(digest), "")
+      await writeIfMissing(unprocessedPath(digest), "[]")
+      await writeIfMissing(failuresPath(digest), "[]")
       await writeIfMissing(`${subjectDirectory(digest)}/subject`, subject)
       return digest
     },
@@ -128,14 +130,57 @@ export function createExpoClientStorage(dataDir, { sha256, subjectDigest, random
     async readBlob(digest, expectedHash) {
       return new File(blobPath(digest, expectedHash)).bytes()
     },
+
+    async dropBlob(digest, expectedHash) {
+      const file = new File(blobPath(digest, expectedHash))
+      if (file.exists) file.delete()
+    },
+
+    async ensureClientId() {
+      const file = new File(clientIdPath())
+      if (file.exists) {
+        const text = (await file.text()).trim()
+        if (text) return text
+      }
+      const id = randomId()
+      await writeAtomic(clientIdPath(), id)
+      return id
+    },
+
+    async readUnprocessed(digest) {
+      return readJsonArray(unprocessedPath(digest))
+    },
+
+    async writeUnprocessed(digest, rows) {
+      await writeAtomic(unprocessedPath(digest), JSON.stringify(rows))
+    },
+
+    async readFailures(digest) {
+      return readJsonArray(failuresPath(digest))
+    },
+
+    async writeFailures(digest, rows) {
+      await writeAtomic(failuresPath(digest), JSON.stringify(rows))
+    },
   }
 
   function currentPath() { return `${root}/current` }
+  function clientIdPath() { return `${root}/client-id` }
   function subjectDirectory(digest) { return `${root}/subjects/${digest}` }
   function attachmentsDirectory(digest) { return `${subjectDirectory(digest)}/attachments` }
   function pointerPath(digest) { return `${subjectDirectory(digest)}/pointer` }
   function outboxPath(digest) { return `${subjectDirectory(digest)}/outbox.jsonl` }
+  function unprocessedPath(digest) { return `${subjectDirectory(digest)}/unprocessed.json` }
+  function failuresPath(digest) { return `${subjectDirectory(digest)}/failures.json` }
   function blobPath(digest, hash) { return `${attachmentsDirectory(digest)}/${hash}` }
+
+  async function readJsonArray(path) {
+    const file = new File(path)
+    if (!file.exists) return []
+    const text = await file.text()
+    const parsed = text ? JSON.parse(text) : []
+    return Array.isArray(parsed) ? parsed : []
+  }
 
   function directory(uri) { return new Directory(uri) }
 

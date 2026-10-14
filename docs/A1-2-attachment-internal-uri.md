@@ -54,7 +54,7 @@ await client.use(subject, applyChange, { readAttachment })
 
 **Hash during the PUT stream.** `sha256` is not known until every byte has been read. Do not buffer the file on the client to hash first, and do not require the host to hash at save. `PUT /sync` (no `?sha256=` on the way in) streams from `readAttachment`. The server already hashes while it receives (`writeHashed`). The PUT **response** is `{ sha256, size }`. The client writes those onto the outbox manifest, then POSTs. The server temp is keyed by that hash for the rest of this `sync()` only (`GET /sync?sha256=` still serves that temp in the window). After the temp is deleted, the same GET calls the server `readAttachment`.
 
-**Server** deletes the PUT temp after `applyChange` finishes. That is the only SyncBridge byte copy, and it is not durable.
+**Server** acks after the log row and the PUT temp are saved. The worker deletes the PUT temp after `applyChange` succeeds. A failed apply keeps the temp. That temp is the only SyncBridge byte copy, and it is not durable. The same rule applies on the client: `sync()` saves the downloaded bytes, then the client worker applies.
 
 ```mermaid
 sequenceDiagram
@@ -79,13 +79,14 @@ sequenceDiagram
   Server-->>Client: sha256 and size
   Client->>Outbox: fill sha256 size
   Client->>Server: POST changelog manifest
+  Server->>Server: append changelog0 and enqueue
+  Server-->>Client: status succeed
+  Client->>Outbox: drop accepted line
   Server->>Host: applyChange PUT temp
   Host->>Store: persist file
   Host-->>Server: maybe new path
   Server->>Server: write path on changelog0
   Server->>Server: delete PUT temp
-  Server-->>Client: acceptedIds entries with path
-  Client->>Outbox: drop accepted line
 ```
 
 ```mermaid
@@ -103,7 +104,8 @@ sequenceDiagram
   Host->>Store: stream via host read of path
   Host-->>Server: stream
   Server-->>ClientB: bytes
-  ClientB->>AppB: applyChange writes local store
+  ClientB->>ClientB: save log entry and attachment temp
+  ClientB->>AppB: worker applyChange writes local store
 ```
 
 ## 2. Host UI — not SyncBridge
@@ -114,14 +116,14 @@ SyncBridge does not list business objects. The host owns its store. Screens read
 
 - Manifest on the log is `{ id, sha256, size, contentType, path }` — `path` replaces `name`. At `appendChanges` only `{ id, path, contentType }` is required. [src/contracts.js](../src/contracts.js): no `bytes`.
 - [src/http-transport.js](../src/http-transport.js): `PUT /sync` streams without a hash query; response `{ sha256, size }`. `GET /sync?sha256=` returns bytes. While the PUT temp exists, that temp is the body. After it is deleted, the server calls `readAttachment`.
-- [src/sync-client.js](../src/sync-client.js): outbox only; `sync()` PUT from `readAttachment`, then fill hash/size, then POST. A received entry's `read()` calls `GET /sync?sha256=`.
-- [src/sync-server.js](../src/sync-server.js): hash the PUT stream; after `applyChange` returns `{ attachments: [{ id, path }] }`, patch `path` if the host moved the file, then delete PUT temp. Failed apply rolls back the tip and keeps the temp for retry. `init(subject, applyChange, { readAttachment })` registers the reader used once the temp is gone. The live subject comes from `currentSubject(req)`.
+- [src/sync-client.js](../src/sync-client.js): outbox send count, unprocessed queue, and failure list. `sync()` PUTs from `readAttachment`, fills hash/size, then POSTs. It returns after the ack and after each downloaded entry is saved. A received entry's later `read()` uses that temp. Three failure acks record `send failed after 3 attempts`. Three apply throws record `apply failed after 3 attempts`.
+- [src/sync-server.js](../src/sync-server.js): hash the PUT stream and ack before apply. The worker, after `applyChange` returns `{ attachments: [{ id, path }] }`, patches `path` if the host moved the file, then deletes the PUT temp. Three apply throws keep the temp and record the apply error. A refused upload stores nothing and writes no failure-list row. `init(subject, applyChange, { readAttachment })` registers the reader used once the temp is gone. The live subject comes from `currentSubject(req)`. Per-client send attempts decide when a download is resent or skipped.
 - Do not add `uri` or `getUri`. Do not require the host to pre-hash.
 - Update [docs/A0-syncbridge-requirements.md](./A0-syncbridge-requirements.md), [docs/A1-syncbridge-highlevel-design.md](./A1-syncbridge-highlevel-design.md), and [README.md](../README.md): `name` → `path`; no durable attachment store; host streams via `path`.
 
 **Acceptance.** The whole suite is a **full regression**: `npm test` (every file under [test/](../test/)) must pass. Existing e2e and unit tests stay; update any that still send `bytes` / `name`. Host doubles for the new contract map `path` → a file the test already wrote.
 
-**Primary e2e for this change.** A Node client and an Expo-style (fetch stream) client each `appendChanges` a file by `path`, `sync()` onto the server, and `applyChange` on the server sees the bytes. After `sync()` returns:
+**Primary e2e for this change.** A Node client and an Expo-style (fetch stream) client each `appendChanges` a file by `path`, `sync()` onto the server, and `applyChange` on the server sees the bytes. After `sync()` returns and `whenIdle()` resolves:
 
 - the server applied the file
 - client `dataDir` has no `attachments/` tree (no client staging copy)

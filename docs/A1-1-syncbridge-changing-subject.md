@@ -75,7 +75,7 @@ Do not reset to `0` on every current change. That would replay a known log onto 
 The host owns the live root. On every `POST /sync` (the call that already names a subject) the response includes that string:
 
 ```js
-{ acceptedIds, entries, attachmentHashes, subject }
+{ status, acceptedIds, entries, attachmentHashes, skipped, subject }
 ```
 
 `subject` is the **live** root, not the one the client sent. The extra field is cheap next to attachments.

@@ -106,16 +106,16 @@ During `sync()`:
 
 ```text
 sender         readAttachment streams the host file
-server         hash the PUT stream, return sha256 and size
-server         append the package manifest to changelog0
-server         applyChange, then delete the PUT temp
-receiver       GET /sync?sha256=
-server         readAttachment streams path from the log
-receiver       call applyChange(entry, attachments)
-receiver       advance pointer
+receiver       hash the PUT stream, return sha256 and size
+receiver       save the log entry and the attachment temp, then ack
+sender         drop the outbox id on succeed
+worker         applyChange from the unprocessed queue
+worker         on success, update path and delete the temp
 ```
 
-`applyChange` may return `{ attachments: [{ id, path }] }` so the log's `path` matches where the host stored the file. If transfer or `applyChange` fails, the pointer stays unchanged and the next `sync()` retries.
+The two directions use the same roles. The client is the sender and the server is the receiver for an upload. The server is the sender and the client is the receiver for a download. A `failed`, `partial`, or `error` ack adds one to that entry's send count. Attempts 1 and 2 keep it and send nothing after it. Attempt 3 moves it to the sender's failure list with `send failed after 3 attempts: …`, then the same `sync()` sends the next entry. The receiver does not count and does not write a failure-list row for a change it refused.
+
+`applyChange` may return `{ attachments: [{ id, path }] }` so the log's `path` matches where the host stored the file. The worker calls it after the ack. The first two throws retry the head. The third writes `apply failed after 3 attempts: …` and continues. The pointer already moved when the entry was saved.
 
 The callback contract is:
 
@@ -175,9 +175,12 @@ await client.use(subject, applyChange, { readAttachment })
 `dataDir` is a persistent app directory. The Node entry uses Node file APIs; the Expo entry uses Expo file APIs. SyncBridge persists the current subject and, for every subject this device has seen, that subject's pointer and outbox. It does not copy attachment bytes:
 
 ```text
+<dataDir>/client-id
 <dataDir>/current
 <dataDir>/subjects/<encoded-subject>/pointer
 <dataDir>/subjects/<encoded-subject>/outbox.jsonl
+<dataDir>/subjects/<encoded-subject>/unprocessed.json
+<dataDir>/subjects/<encoded-subject>/failures.json
 ```
 
 That directory set is the persisted list `{ subject, pointer }`. There is no second index. A subject this client has never seen gets `pointer` `0`: every server log entry is new. A subject this client has seen keeps its file. Changing current does not rewrite another subject's pointer.
@@ -189,8 +192,12 @@ use(subject, applyChange, { readAttachment })   // create if new, reuse pointer 
 current() → subject | null
 subjects() → [subject]
 appendChanges(changeLog)    // queues on current (offline ok)
-async sync() → { subject } | { switched: true, subject }
+async sync() → { status, subject? } | { status: "switched", switched: true, subject }
+failedEntries() → [{ id, error, failedAt }]
+whenIdle()       // current subject's unprocessed queue is empty
 ```
+
+`sync()` returns `{ status: "succeed", subject }`, `{ status: "partial", subject, error }`, `{ status: "failed", error }` with `subject` when the request named one, `{ status: "error", error }` with `subject` when the request named one, or `{ status: "switched", switched: true, subject }`. A capped send that then delivers a later outbox entry still returns `succeed`. A local apply failure does not fail `sync()`.
 
 `applyChange` is per subject. Two roots are two local trees. Do not reuse one callback that always writes the same directory.
 
@@ -200,21 +207,24 @@ async sync() → { subject } | { switched: true, subject }
 
 ```text
 sync:
-  send current subject, that subject's pointer, and that subject's queued changes
-  remove each change the server accepts
+  send one outbox entry and its attachments
+  a failed, partial, or error ack counts one send attempt
+  attempts 1 and 2 stop the send loop
+  attempt 3 records send failed after 3 attempts and continues
 
   receive the live subject on the response (see §4.1)
   if the live subject differs from current:
     persist current + first-seen pointer 0
-    return { switched: true, subject: live } (do not apply the stale body)
+    return { status: "switched", switched: true, subject: live }
 
-  receive entries after the saved pointer
-  for each entry:
-    applyChange(entry)
-    save entry.position as the new pointer for this subject
+  for each entry after the saved pointer:
+    save the log entry and the attachment temps
+    on success, enqueue unprocessed, save the pointer, wake the worker
+    on failure, post receiveFailed and stop; the server resends or skips
+  return after that save; the worker applies later
 ```
 
-The pointer is saved only after `applyChange` succeeds. If applying an entry fails, the pointer remains unchanged and the next `sync()` receives that entry again.
+The pointer is saved when the entry is stored, before `applyChange`. A later apply failure does not move it back. `whenIdle()` waits until the unprocessed queue is empty.
 
 ### 4.1 Changing the live subject (server folder)
 
@@ -223,7 +233,7 @@ The host application owns the live root (the configured driver folder). SyncBrid
 On every `POST /sync` — the call that already names a subject — the **host** puts the live subject on the response:
 
 ```js
-{ acceptedIds, entries, attachmentHashes, subject }
+{ status, acceptedIds, entries, attachmentHashes, skipped, subject }
 ```
 
 `subject` is always the live root, not “the one the client sent.” The extra string is cheap next to attachments. `PUT` and `GET` of raw attachment bytes do not carry a subject.
@@ -256,14 +266,19 @@ syncServer.init(subject, applyChange, { readAttachment })
 
 SyncServer owns `<dataDir>/syncbridge.sqlite`. It stores `log_entries` indexed by `(subject, position)` and `(subject, id)`, so it can return entries after a pointer without scanning a text file. BizServer does not open the database or implement log storage methods.
 
-When a client sends `{ subject, pointer, changes }`, and the host says that subject is current, SyncServer:
+When a client sends `{ subject, pointer, changes, clientId }`, and the host says that subject is current, SyncServer:
 
 1. Opens that subject's log (`changelog0` for that subject only).
-2. Appends each new client change once and assigns its position.
-3. Calls the server `applyChange(entry)` for each accepted client change.
-4. Returns records after `pointer`, plus the live `subject` the host provided.
+2. Appends each new client change once, enqueues it, and assigns its position. A duplicate id is accepted and not appended again.
+3. Acks `succeed`, `partial`, or `failed` without calling `applyChange`. A refused change is not stored and is not written to the failure list.
+4. Returns records after `pointer` for that `clientId`, plus `skipped` ids this client has already given up, plus the live `subject`.
+5. Wakes the worker. The worker drains the unprocessed queue outside the request lock.
 
-When BizServer calls `appendChanges(subject, changeLog)`, SyncServer writes that change to that subject's `changelog0` but does not apply it again: BizServer already wrote its own business storage.
+`receiveFailed` for a `clientId` increments that send attempt. Below 3, the next response repeats that entry and does not include later ones. At 3, the server writes `send failed after 3 attempts: …` for that client and continues with the next log entry. Other clients still receive the row.
+
+When BizServer calls `appendChanges(subject, changeLog)`, SyncServer writes that change to that subject's `changelog0` and does not enqueue it. The call returns while a client apply may still be running.
+
+Predicted POST statuses are `succeed`, `partial`, `failed`, and `switched` (HTTP 409). Any other throw is `{ status: "error", error }` with HTTP 200. The process, the worker, and later syncs stay up.
 
 The transport host is responsible for authenticating callers, authorizing which subjects they may use, and naming the live subject on every `POST /sync`. SyncBridge treats a subject as a log name only.
 
@@ -271,8 +286,8 @@ The transport host is responsible for authenticating callers, authorizing which 
 
 ```text
 BizClient    applyChange(entry, attachments), appendChanges; asks host for live subject
-SyncClient   use, current, subjects, sync, appendChanges
-SyncServer   init, receive, appendChanges
+SyncClient   use, current, subjects, sync, appendChanges, failedEntries, whenIdle
+SyncServer   init, handle, appendChanges, failedEntries, whenIdle
 BizServer    applyChange(entry, attachments), appendChanges
 Host         live subject on POST /sync; reject a request subject that is not live; readAttachment streams path after the PUT temp is gone
 ```

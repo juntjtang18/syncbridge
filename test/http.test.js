@@ -36,6 +36,8 @@ test("handle stages a stream and applies the posted change on any host path", as
     attachments: [{ id: "photo-1", path: "poi-1.jpg", contentType: "image/jpeg" }],
   })
   await client.sync()
+  await server.whenIdle()
+  await client.whenIdle()
   assert.equal(applies, 1)
   await assertNoServerStaging(dirs.server)
   await assertNoClientStaging(dirs.client)
@@ -63,9 +65,11 @@ test("handle stages a stream and applies the posted change on any host path", as
   })
   assert.equal(duplicate.status, 200)
   assert.deepEqual(await duplicate.json(), {
+    status: "succeed",
     acceptedIds: [appended.id],
     entries: [],
     attachmentHashes: [],
+    skipped: [],
     subject,
   })
   assert.equal(applies, 1)
@@ -131,10 +135,12 @@ test("POST echoes the live subject and refuses a stale one", async (t) => {
   })
   assert.equal(stale.status, 409)
   assert.deepEqual(await stale.json(), {
+    status: "switched",
     subject: liveB,
     acceptedIds: [],
     entries: [],
     attachmentHashes: [],
+    skipped: [],
   })
 })
 
@@ -164,6 +170,8 @@ test("an Expo-style fetch stream client syncs a changelog and attachment both wa
     attachments: [{ id: "photo-1", path: "poi-1.jpg", contentType: "image/jpeg" }],
   })
   await sender.sync()
+  await server.whenIdle()
+  await sender.whenIdle()
   assert.equal(serverApplies, 1)
   await assertNoServerStaging(dirs.server)
   await assertNoClientStaging(dirs.client)
@@ -177,6 +185,7 @@ test("an Expo-style fetch stream client syncs a changelog and attachment both wa
     })
   }, { readAttachment: store.readAttachment })
   await receiver.sync()
+  await receiver.whenIdle()
   assert.equal(received.length, 1)
   assert.equal(received[0].data.poi, "south-wall")
   assert.deepEqual(Buffer.from(received[0].bytes), photo)
@@ -192,7 +201,7 @@ function createExpoStyleClient({ dataDir, url }) {
   })
 }
 
-test("a throwing applyChange rolls the log tip back through the handler", async (t) => {
+test("a throwing applyChange stays on the log and is listed after three attempts", async (t) => {
   const dirs = await tempDirs(t)
   let calls = 0
   const server = createSyncServer({ dataDir: dirs.server })
@@ -200,18 +209,23 @@ test("a throwing applyChange rolls the log tip back through the handler", async 
   const endpoints = await listen(server, t)
   server.init(subject, async () => {
     calls += 1
-    if (calls === 1) throw new Error("server failed")
+    throw new Error("server failed")
   })
-  const positions = []
   const client = createSyncClient({ dataDir: dirs.client, url: endpoints.url })
-  await client.init(subject, async (entry) => {
-    positions.push(entry.position)
-  })
-  await client.appendChanges({ data: "retry" })
-  await assert.rejects(() => client.sync(), /server failed/)
-  await client.sync()
-  assert.equal(calls, 2)
-  assert.deepEqual(positions, [1])
+  await client.init(subject, async () => {})
+  await client.appendChanges({ data: "kept" })
+  const synced = await client.sync()
+  await server.whenIdle()
+  assert.deepEqual(synced, { status: "succeed", subject })
+  assert.equal(calls, 3)
+  const failed = server.failedEntries(subject)
+  assert.equal(failed.length, 1)
+  assert.match(failed[0].error, /apply failed after 3 attempts: server failed/)
+  const Database = (await import("better-sqlite3")).default
+  const db = new Database(path.join(dirs.server, "syncbridge.sqlite"), { readonly: true })
+  const row = db.prepare("SELECT package_json FROM log_entries").get()
+  db.close()
+  assert.match(row.package_json, /kept/)
 })
 
 async function tempDirs(t) {

@@ -14,17 +14,81 @@ import {
 } from "./contracts.js"
 import { writeHashed } from "./hash-stream.js"
 
+const ATTEMPT_LIMIT = 3
+
 export function createServer({ storage, currentSubject }) {
   if (currentSubject !== undefined && typeof currentSubject !== "function") {
     throw new TypeError("currentSubject must be a function")
   }
   const callbacks = new Map()
   let tail = Promise.resolve()
+  let drain = Promise.resolve()
+  let stopped = false
+  let idle = true
 
   function exclusive(work) {
     const run = tail.then(work, work)
     tail = run.then(() => {}, () => {})
     return run
+  }
+
+  function wake() {
+    if (stopped) return
+    idle = false
+    drain = drain.then(() => pump(), () => pump()).then(() => {
+      idle = !storage.hasUnprocessed()
+    }, () => {
+      idle = !storage.hasUnprocessed()
+    })
+  }
+
+  async function pump() {
+    while (!stopped) {
+      const row = storage.headUnprocessed()
+      if (!row) return
+      await applyRow(row)
+    }
+  }
+
+  async function applyRow(row) {
+    const registered = callbacks.get(row.subject)
+    try {
+      if (!registered?.applyChange) throw new Error(`subject is not initialized: ${row.subject}`)
+      const applied = await registered.applyChange(
+        { id: row.id, position: row.position, package: row.package },
+        readerFor(storage, row.package.attachments),
+      )
+      if (applied?.attachments) storage.updateAttachmentPaths(row.subject, row.id, applied.attachments)
+      for (const manifest of row.package.attachments || []) storage.dropBlob(manifest.sha256)
+      storage.removeUnprocessed(row.subject, row.id)
+    } catch (error) {
+      const attempts = row.attempts + 1
+      if (attempts < ATTEMPT_LIMIT) {
+        storage.setUnprocessedAttempts(row.subject, row.id, attempts)
+        row.attempts = attempts
+        await applyRow(row)
+        return
+      }
+      storage.recordFailure({
+        subject: row.subject,
+        position: row.position,
+        id: row.id,
+        clientId: "",
+        kind: "apply",
+        error: `apply failed after 3 attempts: ${messageOf(error)}`,
+        failedAt: new Date().toISOString(),
+      })
+      storage.removeUnprocessed(row.subject, row.id)
+    }
+  }
+
+  function whenIdle() {
+    if (stopped) return Promise.resolve()
+    wake()
+    const pending = drain
+    return pending.then(() => {
+      if (!stopped && storage.hasUnprocessed()) return whenIdle()
+    })
   }
 
   return {
@@ -34,14 +98,15 @@ export function createServer({ storage, currentSubject }) {
       const readAttachment = requireReadAttachment(options?.readAttachment)
       if (callbacks.has(key)) throw new Error(`subject already initialized: ${key}`)
       callbacks.set(key, { applyChange, readAttachment })
+      wake()
     },
 
     handle(req, res) {
       return exclusive(async () => {
         try {
-          await dispatch(req, res, storage, callbacks, currentSubject)
+          await dispatch(req, res, storage, callbacks, currentSubject, wake)
         } catch (error) {
-          writeError(res, error)
+          writeAckError(res, error)
         }
       })
     },
@@ -57,20 +122,42 @@ export function createServer({ storage, currentSubject }) {
       })
     },
 
+    failedEntries(subject) {
+      return storage.failedEntries(requireSubject(subject))
+    },
+
+    unprocessed(subject) {
+      return storage.listUnprocessed(requireSubject(subject))
+    },
+
+    setUnprocessed(subject, rows) {
+      const key = requireSubject(subject)
+      storage.replaceUnprocessed(key, normalizeQueue(rows, "unprocessed"))
+      wake()
+    },
+
+    whenIdle,
+
     close() {
-      storage.close()
+      stopped = true
+      if (idle) {
+        storage.close()
+        return undefined
+      }
+      const pending = drain
+      return pending.then(() => storage.close(), () => storage.close())
     },
   }
 }
 
-async function dispatch(req, res, storage, callbacks, currentSubject) {
+async function dispatch(req, res, storage, callbacks, currentSubject, wake) {
   const query = new URL(req.url || "/", "http://localhost").searchParams
   if (req.method === "PUT") {
     await handlePut(req, res, storage)
     return
   }
   if (req.method === "POST") {
-    const result = await handlePost(req, storage, callbacks, currentSubject)
+    const result = await handlePost(req, storage, callbacks, currentSubject, wake)
     sendJson(res, result.status, result.body)
     return
   }
@@ -90,11 +177,15 @@ async function handlePut(req, res, storage) {
     sendJson(res, 200, { sha256: written.hash, size: written.size })
   } catch (error) {
     storage.discardBlob(tempPath)
-    throw error
+    if (res.headersSent || res.writableEnded) return
+    sendJson(res, 200, {
+      status: isPredicted(error) ? "failed" : "error",
+      error: messageOf(error),
+    })
   }
 }
 
-async function handlePost(req, storage, callbacks, currentSubject) {
+async function handlePost(req, storage, callbacks, currentSubject, wake) {
   const body = await readJson(req)
   if (body === null || typeof body !== "object" || Array.isArray(body)) {
     throw new TypeError("request must be an object")
@@ -104,14 +195,116 @@ async function handlePost(req, storage, callbacks, currentSubject) {
     ? subject
     : requireSubject(await currentSubject(req))
   if (live !== subject) {
-    return {
-      status: 409,
-      body: { subject: live, acceptedIds: [], entries: [], attachmentHashes: [] },
-    }
+    return { status: 409, body: emptyAck("switched", live) }
   }
   if (!callbacks.has(subject)) throw new Error(`subject is not initialized: ${subject}`)
-  const result = await receiveLocked(storage, callbacks, body)
-  return { status: 200, body: { ...result, subject } }
+  const clientId = optionalClientId(body.clientId)
+  const failures = receiveFailureList(body.receiveFailed)
+  if (failures.length > 0 && !clientId) throw new TypeError("clientId is required")
+  const pointer = requirePointer(body.pointer)
+
+  const skipped = []
+  for (const failure of failures) {
+    const noted = noteReceiveFailure(storage, subject, clientId, failure)
+    if (noted) skipped.push(noted)
+  }
+
+  const changes = body.changes ?? []
+  if (!Array.isArray(changes)) throw new TypeError("changes must be an array")
+  const acceptedIds = []
+  let failure = null
+  let enqueued = false
+  for (const change of changes) {
+    try {
+      const stored = acceptChange(storage, subject, change)
+      if (stored.enqueued) enqueued = true
+      acceptedIds.push(stored.id)
+    } catch (error) {
+      if (!isPredicted(error)) throw error
+      failure = error
+      break
+    }
+  }
+
+  const delivery = clientId
+    ? deliveryFor(storage, subject, pointer, clientId)
+    : { skipped: [], entries: storage.entriesAfter(subject, pointer) }
+  const seen = new Set(skipped.map((item) => item.id))
+  for (const item of delivery.skipped) {
+    if (!seen.has(item.id)) skipped.push(item)
+  }
+  if (enqueued) wake()
+
+  return {
+    status: 200,
+    body: {
+      ...emptyAck(failure ? (acceptedIds.length > 0 ? "partial" : "failed") : "succeed", subject),
+      acceptedIds,
+      entries: delivery.entries,
+      skipped,
+      ...(failure ? { error: failure.message } : {}),
+    },
+  }
+}
+
+function acceptChange(storage, subject, change) {
+  if (change === null || typeof change !== "object") throw new TypeError("change must be an object")
+  if (typeof change.id !== "string" || change.id.length === 0) {
+    throw new TypeError("change.id must be a non-empty string")
+  }
+  const packageValue = persistedPackage(change.package)
+  if (storage.hasEntry(subject, change.id)) return { id: change.id, enqueued: false }
+  for (const manifest of packageValue.attachments) {
+    try {
+      storage.requireBlob(manifest.sha256, manifest.size)
+    } catch {
+      throw new Error(`attachment verification failed for ${manifest.id}`)
+    }
+  }
+  const result = storage.appendEntry(subject, change.id, packageValue)
+  if (result.duplicate) return { id: change.id, enqueued: false }
+  storage.enqueueUnprocessed(subject, result.position, change.id, packageValue)
+  return { id: change.id, enqueued: true }
+}
+
+function noteReceiveFailure(storage, subject, clientId, failure) {
+  const existing = storage.sendFailure(subject, clientId, failure.id)
+  if (existing) return { id: existing.id, position: existing.position }
+  const entry = storage.entryById(subject, failure.id)
+  if (!entry) return null
+  const attempts = storage.incrementSendAttempts(subject, clientId, failure.id)
+  if (attempts < ATTEMPT_LIMIT) return null
+  storage.recordFailure({
+    subject,
+    position: entry.position,
+    id: entry.id,
+    clientId,
+    kind: "send",
+    error: `send failed after 3 attempts: ${failure.error}`,
+    failedAt: new Date().toISOString(),
+  })
+  return { id: entry.id, position: entry.position }
+}
+
+function deliveryFor(storage, subject, pointer, clientId) {
+  const rows = storage.entriesAfter(subject, pointer)
+  const skipped = []
+  const entries = []
+  let retry = null
+  for (const row of rows) {
+    if (storage.sendFailure(subject, clientId, row.id)) {
+      skipped.push({ id: row.id, position: row.position })
+      continue
+    }
+    const attempts = storage.sendAttempts(subject, clientId, row.id)
+    if (attempts > 0 && attempts < ATTEMPT_LIMIT) {
+      retry = row
+      break
+    }
+    entries.push(row)
+  }
+  if (retry) return { skipped, entries: [retry] }
+  return { skipped, entries }
 }
 
 async function handleGet(req, res, storage, callbacks, currentSubject, query) {
@@ -159,61 +352,74 @@ async function handleGet(req, res, storage, callbacks, currentSubject, query) {
   res.end(Buffer.from(bytes))
 }
 
-async function receiveLocked(storage, callbacks, request) {
-  if (request === null || typeof request !== "object") throw new TypeError("request must be an object")
-  const subject = requireSubject(request.subject)
-  const registered = callbacks.get(subject)
-  const applyChange = registered?.applyChange
-  if (!applyChange) throw new Error(`subject is not initialized: ${subject}`)
-  const pointer = requirePointer(request.pointer)
-  const changes = request.changes ?? []
-  if (!Array.isArray(changes)) throw new TypeError("changes must be an array")
+function normalizeQueue(rows, label) {
+  if (!Array.isArray(rows)) throw new TypeError(`${label} must be an array`)
+  return rows.map((row) => {
+    if (row === null || typeof row !== "object" || Array.isArray(row)) {
+      throw new TypeError(`${label} entry must be an object`)
+    }
+    if (typeof row.id !== "string" || row.id.length === 0) throw new TypeError(`${label} id is invalid`)
+    if (!Number.isInteger(row.position) || row.position < 1) throw new TypeError(`${label} position is invalid`)
+    const attempts = row.attempts ?? 0
+    if (!Number.isInteger(attempts) || attempts < 0) throw new TypeError(`${label} attempts is invalid`)
+    return {
+      id: row.id,
+      position: row.position,
+      package: queuePackage(row.package),
+      attempts,
+    }
+  })
+}
 
-  const acceptedIds = []
-  for (const change of changes) {
-    if (change === null || typeof change !== "object") throw new TypeError("change must be an object")
-    if (typeof change.id !== "string" || change.id.length === 0) {
-      throw new TypeError("change.id must be a non-empty string")
-    }
-    const packageValue = persistedPackage(change.package)
-    const existing = storage.hasEntry(subject, change.id)
-    if (existing) {
-      acceptedIds.push(change.id)
-      continue
-    }
-    for (const manifest of packageValue.attachments) {
-      try {
-        storage.requireBlob(manifest.sha256, manifest.size)
-      } catch {
-        throw new Error(`attachment verification failed for ${manifest.id}`)
-      }
-    }
-    const result = storage.appendEntry(subject, change.id, packageValue)
-    const entry = { id: change.id, position: result.position, package: packageValue }
-    try {
-      const applied = await applyChange(entry, readerFor(storage, packageValue.attachments))
-      if (applied?.attachments) {
-        storage.updateAttachmentPaths(subject, change.id, applied.attachments)
-      }
-      for (const manifest of packageValue.attachments) {
-        storage.dropBlob(manifest.sha256)
-      }
-    } catch (error) {
-      storage.removeTip(subject, change.id, result.position)
-      throw error
-    }
-    acceptedIds.push(change.id)
+function queuePackage(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("package must be an object")
   }
+  if (!Object.hasOwn(value, "data")) throw new TypeError("package.data is required")
+  const attachments = value.attachments ?? []
+  if (!Array.isArray(attachments)) throw new TypeError("package.attachments must be an array")
+  return { data: value.data, attachments }
+}
 
-  return {
-    acceptedIds,
-    entries: storage.entriesAfter(subject, pointer),
-    attachmentHashes: [],
-  }
+function emptyAck(status, subject) {
+  return { status, subject, acceptedIds: [], entries: [], attachmentHashes: [], skipped: [] }
+}
+
+function optionalClientId(value) {
+  if (value == null || value === "") return ""
+  if (typeof value !== "string") throw new TypeError("clientId must be a string")
+  return value
+}
+
+function receiveFailureList(value) {
+  if (value == null) return []
+  if (!Array.isArray(value)) throw new TypeError("receiveFailed must be an array")
+  return value.map((item) => {
+    if (typeof item === "string" && item.length > 0) {
+      return { id: item, error: "receiver could not store the log entry" }
+    }
+    if (item && typeof item.id === "string" && item.id.length > 0) {
+      const error = typeof item.error === "string" && item.error.length > 0
+        ? item.error
+        : "receiver could not store the log entry"
+      return { id: item.id, error }
+    }
+    throw new TypeError("receiveFailed id is invalid")
+  })
 }
 
 function isMissing(error) {
   return error instanceof Error && /missing/i.test(error.message)
+}
+
+function isPredicted(error) {
+  if (error instanceof TypeError) return true
+  if (!(error instanceof Error)) return false
+  return /attachment verification failed|attachment hash|attachment cache|must be|invalid|required/.test(error.message)
+}
+
+function messageOf(error) {
+  return error instanceof Error && error.message ? error.message : "request failed"
 }
 
 function requireSha256(query) {
@@ -248,10 +454,16 @@ function sendJson(res, status, value) {
   res.end(payload)
 }
 
-function writeError(res, error) {
+function writeAckError(res, error) {
   if (res.headersSent || res.writableEnded) return
-  const status = error instanceof TypeError ? 400 : 500
-  sendJson(res, status, { error: error.message || "request failed" })
+  sendJson(res, 200, {
+    status: isPredicted(error) ? "failed" : "error",
+    error: messageOf(error),
+    acceptedIds: [],
+    entries: [],
+    attachmentHashes: [],
+    skipped: [],
+  })
 }
 
 function readerFor(storage, manifests) {
