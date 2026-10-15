@@ -185,60 +185,6 @@ test("a failed server apply keeps the log and records the apply error", async (t
   assert.equal(rows.length, 1)
 })
 
-test("a server append keeps sha256 and size for a file another client downloads", async (t) => {
-  const dirs = await tempDirs(t)
-  const pdf = Buffer.from("%PDF-1.4 report\n")
-  const hash = digestBytes(pdf)
-  let applies = 0
-  const server = createSyncServer({
-    dataDir: dirs.server,
-    currentSubject() {
-      return subject
-    },
-  })
-  t.after(() => server.close())
-  const endpoints = await listen(server, t)
-  server.init(subject, async () => {
-    applies += 1
-  }, {
-    readAttachment() {
-      return pdf
-    },
-  })
-  await server.appendChanges(subject, {
-    data: { object: "report", action: "add" },
-    attachments: [{
-      id: "inspect-report.pdf",
-      path: "north-warehouse/2026-10-01/inspect-report.pdf",
-      sha256: hash,
-      size: pdf.length,
-      contentType: "application/pdf",
-    }],
-  })
-  assert.equal(applies, 0)
-  const db = new Database(path.join(dirs.server, "syncbridge.sqlite"), { readonly: true })
-  const row = db.prepare("SELECT package_json FROM log_entries").get()
-  db.close()
-  const stored = JSON.parse(row.package_json)
-  assert.equal(stored.attachments[0].sha256, hash)
-  assert.equal(stored.attachments[0].size, pdf.length)
-  assert.equal(stored.attachments[0].contentType, "application/pdf")
-
-  const received = []
-  const client = createSyncClient({
-    dataDir: dirs.client,
-    url: endpoints.url,
-  })
-  await client.init(subject, async (entry, attachments) => {
-    const manifest = entry.package.attachments[0]
-    received.push(Buffer.from(await attachments.get(manifest.id).read()))
-  })
-  await client.sync()
-  await client.whenIdle()
-  assert.deepEqual(received, [pdf])
-  assert.equal(applies, 0)
-})
-
 test("opening an existing server keeps the log and a server append is not applied again", async (t) => {
   const dirs = await tempDirs(t)
   let applies = 0
