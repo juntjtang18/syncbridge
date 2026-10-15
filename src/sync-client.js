@@ -513,6 +513,30 @@ async function ingest(response, context) {
       entries = Array.isArray(ack.entries) ? ack.entries : []
     }
   }
+  await advanceEcho(context, response.echoed)
+}
+
+async function advanceEcho(context, echoed) {
+  if (!Array.isArray(echoed) || echoed.length === 0) return
+  const positions = echoed
+    .filter((item) => item && Number.isInteger(item.position))
+    .map((item) => item.position)
+    .sort((left, right) => left - right)
+  let pointer = await context.storage.readPointer(context.digest)
+  for (const position of positions) {
+    if (position <= pointer) continue
+    if (position !== pointer + 1) break
+    pointer = position
+  }
+  const current = await context.storage.readPointer(context.digest)
+  if (pointer === current) return
+  await context.storage.writePointer(context.digest, pointer)
+  trace(context.log, {
+    side: "client",
+    subject: context.subject,
+    step: "pointer",
+    detail: { position: pointer, echoed: true },
+  })
 }
 
 async function saveReceived(context, entry) {

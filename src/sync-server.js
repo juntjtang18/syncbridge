@@ -246,7 +246,7 @@ async function handlePost(req, storage, callbacks, currentSubject, wake, log) {
   let enqueued = false
   for (const change of changes) {
     try {
-      const stored = acceptChange(storage, subject, change)
+      const stored = acceptChange(storage, subject, change, clientId)
       if (stored.enqueued) {
         enqueued = true
         trace(log, { side: "server", subject, step: "enqueue", id: stored.id, detail: { position: stored.position } })
@@ -261,7 +261,7 @@ async function handlePost(req, storage, callbacks, currentSubject, wake, log) {
 
   const delivery = clientId
     ? deliveryFor(storage, subject, pointer, clientId)
-    : { skipped: [], entries: storage.entriesAfter(subject, pointer) }
+    : { skipped: [], echoed: [], entries: storage.entriesAfter(subject, pointer).map(publicEntry) }
   const seen = new Set(skipped.map((item) => item.id))
   for (const item of delivery.skipped) {
     if (!seen.has(item.id)) skipped.push(item)
@@ -284,13 +284,14 @@ async function handlePost(req, storage, callbacks, currentSubject, wake, log) {
       ...emptyAck(failure ? (acceptedIds.length > 0 ? "partial" : "failed") : "succeed", subject),
       acceptedIds,
       entries: delivery.entries,
+      echoed: delivery.echoed,
       skipped,
       ...(failure ? { error: failure.message } : {}),
     },
   }
 }
 
-function acceptChange(storage, subject, change) {
+function acceptChange(storage, subject, change, clientId) {
   if (change === null || typeof change !== "object") throw new TypeError("change must be an object")
   if (typeof change.id !== "string" || change.id.length === 0) {
     throw new TypeError("change.id must be a non-empty string")
@@ -305,7 +306,7 @@ function acceptChange(storage, subject, change) {
       throw attachmentFailure(error, manifest.id)
     }
   }
-  const result = storage.appendEntry(subject, change.id, packageValue)
+  const result = storage.appendEntry(subject, change.id, packageValue, clientId || null)
   if (result.duplicate) return { id: change.id, enqueued: false }
   storage.enqueueUnprocessed(subject, result.position, change.id, packageValue)
   return { id: change.id, position: result.position, enqueued: true }
@@ -342,9 +343,14 @@ function noteReceiveFailure(storage, subject, clientId, failure, log) {
 function deliveryFor(storage, subject, pointer, clientId) {
   const rows = storage.entriesAfter(subject, pointer)
   const skipped = []
+  const echoed = []
   const entries = []
   let retry = null
   for (const row of rows) {
+    if (row.clientId && row.clientId === clientId) {
+      echoed.push({ id: row.id, position: row.position })
+      continue
+    }
     if (storage.sendFailure(subject, clientId, row.id)) {
       skipped.push({ id: row.id, position: row.position })
       continue
@@ -354,10 +360,14 @@ function deliveryFor(storage, subject, pointer, clientId) {
       retry = row
       break
     }
-    entries.push(row)
+    entries.push(publicEntry(row))
   }
-  if (retry) return { skipped, entries: [retry] }
-  return { skipped, entries }
+  if (retry) return { skipped, echoed, entries: [publicEntry(retry)] }
+  return { skipped, echoed, entries }
+}
+
+function publicEntry(row) {
+  return { id: row.id, position: row.position, package: row.package }
 }
 
 function changesOf(body) {
@@ -454,7 +464,7 @@ function queuePackage(value) {
 }
 
 function emptyAck(status, subject) {
-  return { status, subject, acceptedIds: [], entries: [], attachmentHashes: [], skipped: [] }
+  return { status, subject, acceptedIds: [], entries: [], attachmentHashes: [], skipped: [], echoed: [] }
 }
 
 function optionalClientId(value) {
@@ -553,6 +563,7 @@ function writeAckError(res, error) {
     entries: [],
     attachmentHashes: [],
     skipped: [],
+    echoed: [],
   })
 }
 

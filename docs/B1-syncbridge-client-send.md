@@ -47,6 +47,10 @@ After the attachment upload, the hash and size are written onto the claimed `inf
 
 The loop claims again after a pass. A photo saved while this `sync()` is open goes out before `sync()` returns when the app stays up.
 
+The POST body is `{ subject, pointer, changes, clientId }`. `clientId` is a random id for this install. The first `sync()` writes it to `<dataDir>/client-id` when that file is missing or empty, and later syncs read the same file. One id covers every subject on this `dataDir`. SyncBridge creates it. The host does not pass it in.
+
+The server stores that id on each log row this install appends. Those rows come back as `echoed` positions, not as `entries`. This client moves its pointer across the contiguous echoed positions and does not download them or call `applyChange`. Another install has a different `client-id` file, so it still receives the rows. The same id is how the server counts a failed download for this install only: three failures skip that entry here, and other installs still receive it.
+
 ## 4. Host queue
 
 `outbox()` reads `inflight/` then `incoming/` and does not wait for `sync()`. `setOutbox` waits until the current `sync()` finishes, then replaces both directories with the given records, in order, as `incoming/` files.

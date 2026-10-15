@@ -8,6 +8,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { randomId, sha256, subjectDigest } from "../src/contracts.js"
 import { createFetchTransport } from "../src/fetch-transport.js"
+import { createHttpTransport } from "../src/http-transport.js"
 import { createNodeClientStorage } from "../src/node-client-storage.js"
 import { createClient } from "../src/sync-client.js"
 import { createSyncClient, createSyncServer } from "../src/node.js"
@@ -47,7 +48,7 @@ test("e2e: after changelog sync, a new unseen subject starts at pointer 0", asyn
   await client.whenIdle()
   assert.deepEqual(first, { status: "succeed", subject: subjectA })
   assert.equal(await pointerOf(dirs.client, subjectA), "2")
-  assert.equal(appliedA.length, 2)
+  assert.equal(appliedA.length, 0)
   assert.deepEqual(logSubjects(dirs.server), [subjectA, subjectA])
 
   live = subjectB
@@ -56,7 +57,7 @@ test("e2e: after changelog sync, a new unseen subject starts at pointer 0", asyn
   assert.equal(await client.current(), subjectB)
   assert.equal(await pointerOf(dirs.client, subjectB), "0")
   assert.equal(await pointerOf(dirs.client, subjectA), "2")
-  assert.equal(appliedA.length, 2)
+  assert.equal(appliedA.length, 0)
   assert.deepEqual(logSubjects(dirs.server), [subjectA, subjectA])
 
   await client.use(subjectB, async (entry) => {
@@ -69,9 +70,7 @@ test("e2e: after changelog sync, a new unseen subject starts at pointer 0", asyn
   await client.whenIdle()
   assert.deepEqual(syncedB, { status: "succeed", subject: subjectB })
   assert.equal(await pointerOf(dirs.client, subjectB), "1")
-  assert.deepEqual(appliedB, [
-    { object: "project", action: "add", id: "metro", name: "Metro Bridge" },
-  ])
+  assert.deepEqual(appliedB, [])
   assert.deepEqual(logSubjects(dirs.server), [subjectA, subjectA, subjectB])
 })
 
@@ -116,9 +115,7 @@ test("e2e: after changelog sync, an old known subject reuses its pointer", async
   assert.equal(await client.current(), subjectA)
   assert.equal(await pointerOf(dirs.client, subjectA), "1")
   assert.equal(await pointerOf(dirs.client, subjectB), "1")
-  assert.deepEqual(appliedA, [
-    { object: "project", action: "add", id: "harbor", name: "Harbor Yard" },
-  ])
+  assert.deepEqual(appliedA, [])
 
   await client.use(subjectA, async (entry) => {
     appliedA.push(entry.package.data)
@@ -315,7 +312,7 @@ test("e2e: a robot client records the host log for a sync and a failed apply", a
   const synced = await robot.syncChange(subjectA, { poi: "north-wall" })
   await server.whenIdle()
   assert.equal(synced.status, "succeed")
-  assert.deepEqual(steps(robotLog), ["append", "post", "ack", "enqueue", "save", "pointer", "apply", "applied"])
+  assert.deepEqual(steps(robotLog), ["append", "post", "ack", "pointer"])
   assert.deepEqual(steps(serverLog), ["post", "enqueue", "ack", "apply", "applied"])
   assert.equal(robotLog.find((event) => event.step === "ack").status, "succeed")
   assert.equal(robotLog[0].side, "client")
@@ -332,7 +329,7 @@ test("e2e: a robot client records the host log for a sync and a failed apply", a
   assert.match(applyFailures[2].error, /apply failed/)
   assert.equal(applyFailures[2].attempt, 3)
   assert.ok(robotLog.some((event) => event.step === "ack" && event.status === "succeed"))
-  assert.ok(robotLog.some((event) => event.step === "applied"))
+  assert.equal(robotLog.some((event) => event.step === "applied"), false)
 })
 
 function createRobotClient({ dataDir, url, log }) {
@@ -351,6 +348,146 @@ function createRobotClient({ dataDir, url, log }) {
 function steps(events) {
   return events.map((event) => event.step)
 }
+
+test("e2e: uploaded changes are skipped on the way down in the same sync", async (t) => {
+  const dirs = await tempDirs(t)
+  const server = createSyncServer({ dataDir: dirs.server })
+  t.after(() => server.close())
+  const endpoints = await listen(server, t)
+  server.init(subjectA, async () => {})
+
+  const applied = []
+  const posts = []
+  const real = createHttpTransport({ url: endpoints.url })
+  const client = createClient({
+    storage: createNodeClientStorage(dirs.client),
+    transport: {
+      async post(body) {
+        const response = await real.post(body)
+        posts.push({ body, response })
+        return response
+      },
+      put: (body) => real.put(body),
+      get: (hash) => real.get(hash),
+    },
+    sha256,
+    randomId,
+  })
+  await client.use(subjectA, async (entry) => {
+    applied.push(entry.package.data)
+  })
+  const first = await client.appendChanges({ data: "one" })
+  const second = await client.appendChanges({ data: "two" })
+  const synced = await client.sync()
+  await client.whenIdle()
+
+  assert.equal(synced.status, "succeed")
+  assert.equal(posts.length, 1)
+  const sentIds = posts[0].body.changes.map((change) => change.id)
+  assert.deepEqual(sentIds, [first.id, second.id])
+  assert.deepEqual(posts[0].response.acceptedIds, sentIds)
+  assert.deepEqual(posts[0].response.entries, [])
+  assert.deepEqual(posts[0].response.echoed.map((row) => row.id), sentIds)
+  assert.deepEqual(posts[0].response.echoed.map((row) => row.position), [1, 2])
+  assert.deepEqual(applied, [])
+  assert.equal(await pointerOf(dirs.client, subjectA), "2")
+  assert.deepEqual(logData(dirs.server), ["one", "two"])
+
+  const otherApplied = []
+  const other = createSyncClient({
+    dataDir: path.join(path.dirname(dirs.client), "client-b"),
+    url: endpoints.url,
+  })
+  await other.use(subjectA, async (entry) => {
+    otherApplied.push(entry.package.data)
+  })
+  await other.sync()
+  await other.whenIdle()
+  assert.deepEqual(otherApplied, ["one", "two"])
+  assert.equal(await pointerOf(path.join(path.dirname(dirs.client), "client-b"), subjectA), "2")
+})
+
+test("e2e: the client that uploaded a change does not download it", async (t) => {
+  const dirs = await tempDirs(t)
+  const photo = Buffer.from("own-photo")
+  const store = createHostStore([["shot.jpg", photo]])
+  const server = createSyncServer({
+    dataDir: dirs.server,
+    currentSubject() { return subjectA },
+  })
+  t.after(() => server.close())
+  const endpoints = await listen(server, t)
+  server.init(subjectA, async (entry, attachments) => {
+    const manifest = entry.package.attachments?.[0]
+    if (!manifest) return
+    const bytes = Buffer.from(await attachments.get(manifest.id).read())
+    store.put("server/shot.jpg", bytes)
+    return { attachments: [{ id: manifest.id, path: "server/shot.jpg" }] }
+  }, { readAttachment: store.readAttachment })
+
+  const receiverDir = path.join(path.dirname(dirs.client), "client-b")
+  const receiverApplied = []
+  const receiver = createSyncClient({ dataDir: receiverDir, url: endpoints.url })
+  await receiver.use(subjectA, async (entry, attachments) => {
+    const manifest = entry.package.attachments?.[0]
+    receiverApplied.push({
+      data: entry.package.data,
+      bytes: manifest ? Buffer.from(await attachments.get(manifest.id).read()) : null,
+    })
+  }, { readAttachment: store.readAttachment })
+  await receiver.appendChanges({ data: "first" })
+  await receiver.sync()
+  await receiver.whenIdle()
+  assert.deepEqual(receiverApplied, [])
+  assert.equal(await pointerOf(receiverDir, subjectA), "1")
+
+  let senderGets = 0
+  const senderApplied = []
+  const real = createHttpTransport({ url: endpoints.url })
+  const sender = createClient({
+    storage: createNodeClientStorage(dirs.client),
+    transport: {
+      post: (body) => real.post(body),
+      put: (body) => real.put(body),
+      get(hash) {
+        senderGets += 1
+        return real.get(hash)
+      },
+    },
+    sha256,
+    randomId,
+  })
+  await sender.use(subjectA, async (entry) => {
+    senderApplied.push(entry.package.data)
+  }, { readAttachment: store.readAttachment })
+  await sender.appendChanges({
+    data: "photo",
+    attachments: [{ id: "photo-1", path: "shot.jpg", contentType: "image/jpeg" }],
+  })
+  await sender.sync()
+  await sender.whenIdle()
+  await server.whenIdle()
+  assert.deepEqual(senderApplied, ["first"])
+  assert.equal(senderGets, 0)
+  assert.equal(await pointerOf(dirs.client, subjectA), "2")
+
+  await receiver.sync()
+  await receiver.whenIdle()
+  assert.deepEqual(receiverApplied, [{ data: "photo", bytes: photo }])
+  assert.equal(await pointerOf(receiverDir, subjectA), "2")
+
+  await server.appendChanges(subjectA, { data: "from-server" })
+  await sender.sync()
+  await sender.whenIdle()
+  assert.deepEqual(senderApplied, ["first", "from-server"])
+  assert.equal(senderGets, 0)
+  assert.equal(await pointerOf(dirs.client, subjectA), "3")
+
+  const authors = logAuthors(dirs.server)
+  assert.equal(authors[0], (await readFile(path.join(receiverDir, "client-id"), "utf8")).trim())
+  assert.equal(authors[1], (await readFile(path.join(dirs.client, "client-id"), "utf8")).trim())
+  assert.equal(authors[2], null)
+})
 
 test("e2e: a later append lands in a new incoming queue after the previous one becomes inflight", async (t) => {
   const dirs = await tempDirs(t)
@@ -497,6 +634,13 @@ function logSubjects(serverDir) {
   const rows = db.prepare("SELECT subject FROM log_entries ORDER BY rowid").all()
   db.close()
   return rows.map((row) => row.subject)
+}
+
+function logAuthors(serverDir) {
+  const db = new Database(path.join(serverDir, "syncbridge.sqlite"), { readonly: true })
+  const rows = db.prepare("SELECT client_id FROM log_entries ORDER BY position").all()
+  db.close()
+  return rows.map((row) => row.client_id)
 }
 
 function logData(serverDir) {

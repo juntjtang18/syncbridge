@@ -120,7 +120,7 @@ const client = createSyncClient({
 
 3. Call `init` once the user is known. `init` and `use` are the same call. It sets the current subject. `sync()` and `appendChanges` use that subject only. A subject this phone has never seen starts at pointer `0`. A known subject reuses its pointer.
 
-`applyChange` writes a downloaded entry into local business storage. `attachments.get(id).read()` returns the temp saved during `sync()`. Throw if that local write fails. The pointer stays where the save put it. After three throws the entry is on `failedEntries()` with `apply failed after 3 attempts: …`, and later entries still apply.
+`applyChange` writes a downloaded entry into local business storage. `attachments.get(id).read()` returns the temp saved during `sync()`. Throw if that local write fails. The pointer stays where the save put it. After three throws the entry is on `failedEntries()` with `apply failed after 3 attempts: …`, and later entries still apply. A change this phone uploaded is not downloaded again: the pointer moves past it, and `applyChange` is not called for it.
 
 `readAttachment` reads a local file when this phone sends it. `manifest.path` is the path passed to `appendChanges`.
 
@@ -172,7 +172,7 @@ if (result.status === "failed" || result.status === "partial" || result.status =
 
 Treat the return like this:
 
-- `succeed` means the outbox entries that were accepted are on the server log, and downloaded entries are saved on this phone. Show synced. A send that failed three times is on this phone's failure list, and a later outbox entry sent in the same `sync()` still counts as `succeed`.
+- `succeed` means the outbox entries that were accepted are on the server log, and downloaded entries are saved on this phone. Rows this phone just uploaded are not downloaded again. Show synced. A send that failed three times is on this phone's failure list, and a later outbox entry sent in the same `sync()` still counts as `succeed`.
 - `failed`, `partial`, and `error` mean the attempt is still under the cap of 3. Show the error state. The next `sync()` sends that entry again.
 - `switched` means the live subject changed. `result.subject` is the new current subject. Call `init` again with that subject's `applyChange` before the next sync.
 
@@ -185,6 +185,8 @@ await client.whenIdle()
 `client.failedEntries()` is the list for the current subject. Send rows say `send failed after 3 attempts: …`. Apply rows say `apply failed after 3 attempts: …`.
 
 `appendChanges` writes the change into `incoming/` and returns as soon as that file is on disk. It does not wait for a `sync()` that is already running. `sync()` sends `inflight/` and renames `incoming/` into `inflight/` only when `inflight/` is empty. A photo taken during `sync()` is still on disk if the app exits, and the next launch sends it. The rules are in [B1](./docs/B1-syncbridge-client-send.md).
+
+A change this phone uploads is skipped on the way down in that same `sync()`. The first `sync()` writes a random `clientId` to `dataDir/client-id` when the file is missing or empty. Later syncs send that same id with `subject`, `pointer`, and `changes`. The host does not choose it. One file covers every subject on this `dataDir`. The server stores the id on each log row this install appends. Those rows come back as `echoed` positions, not as `entries`. This phone moves its pointer across them and does not call `applyChange`. Another phone has its own `client-id` file, so it still receives the rows and applies them. A change the server writes with `appendChanges` has no `clientId`, so every phone downloads it.
 
 The host reads and replaces a queue directly. On the phone, `outbox()` reads `inflight/` then `incoming/` and does not wait for `sync()`. `setOutbox(records)` waits until the current `sync()` finishes, then replaces both directories. `unprocessed()` and `setUnprocessed(records)` are the local apply queue. `setUnprocessed` wakes the worker. On the server, `unprocessed(subject)` and `setUnprocessed(subject, records)` are that subject's apply queue. A record is `{ id, package, attempts }` for the upload buffer, and `{ id, position, package, attempts }` for the unprocessed queue. `package` is `{ data, attachments }`.
 
@@ -225,7 +227,7 @@ Each event is `{ at, side, subject, step, id, attempt, status, error, detail }`.
 | `ack` | The response status is known: `succeed`, `partial`, `failed`, `error`, or `switched`. |
 | `enqueue` | A saved entry is placed on the apply queue. |
 | `save` | The phone has stored a downloaded entry. |
-| `pointer` | The phone moved its pointer. |
+| `pointer` | The phone moved its pointer. `detail.echoed` is true when the move skipped rows this phone uploaded. |
 | `send` | A send failed and the attempt is still under 3. |
 | `send-failed` | The third send failure was recorded. |
 | `receive-failed` | The phone could not save a downloaded entry. |

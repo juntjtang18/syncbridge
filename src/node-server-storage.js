@@ -13,6 +13,7 @@ export function createNodeServerStorage(dataDir) {
       position INTEGER NOT NULL,
       id TEXT NOT NULL,
       package_json TEXT NOT NULL,
+      client_id TEXT,
       UNIQUE (subject, position),
       UNIQUE (subject, id)
     );
@@ -47,6 +48,10 @@ export function createNodeServerStorage(dataDir) {
       PRIMARY KEY (subject, client_id, id)
     );
   `)
+  const logColumns = db.prepare("PRAGMA table_info(log_entries)").all()
+  if (!logColumns.some((column) => column.name === "client_id")) {
+    db.exec("ALTER TABLE log_entries ADD COLUMN client_id TEXT")
+  }
 
   const selectById = db.prepare("SELECT position FROM log_entries WHERE subject = ? AND id = ?")
   const selectEntry = db.prepare("SELECT package_json FROM log_entries WHERE subject = ? AND id = ?")
@@ -54,11 +59,11 @@ export function createNodeServerStorage(dataDir) {
   const insertCounter = db.prepare("INSERT INTO subject_counters (subject, next_position) VALUES (?, ?)")
   const updateCounter = db.prepare("UPDATE subject_counters SET next_position = ? WHERE subject = ?")
   const insertEntry = db.prepare(
-    "INSERT INTO log_entries (subject, position, id, package_json) VALUES (?, ?, ?, ?)",
+    "INSERT INTO log_entries (subject, position, id, package_json, client_id) VALUES (?, ?, ?, ?, ?)",
   )
   const updatePackage = db.prepare("UPDATE log_entries SET package_json = ? WHERE subject = ? AND id = ?")
   const selectAfter = db.prepare(`
-    SELECT id, position, package_json
+    SELECT id, position, package_json, client_id
     FROM log_entries
     WHERE subject = ? AND position > ?
     ORDER BY position ASC
@@ -125,14 +130,14 @@ export function createNodeServerStorage(dataDir) {
     UPDATE send_attempts SET attempts = ? WHERE subject = ? AND client_id = ? AND id = ?
   `)
 
-  const append = db.transaction((subject, id, packageValue) => {
+  const append = db.transaction((subject, id, packageValue, clientId) => {
     const existing = selectById.get(subject, id)
     if (existing) return { duplicate: true, position: existing.position }
     const counter = selectCounter.get(subject)
     const position = counter ? counter.next_position : 1
     if (counter) updateCounter.run(position + 1, subject)
     else insertCounter.run(subject, position + 1)
-    insertEntry.run(subject, position, id, JSON.stringify(packageValue))
+    insertEntry.run(subject, position, id, JSON.stringify(packageValue), clientId || null)
     return { duplicate: false, position }
   })
 
@@ -148,8 +153,8 @@ export function createNodeServerStorage(dataDir) {
   }
 
   return {
-    appendEntry(subject, id, packageValue) {
-      return append(subject, id, packageValue)
+    appendEntry(subject, id, packageValue, clientId) {
+      return append(subject, id, packageValue, clientId)
     },
 
     hasEntry(subject, id) {
@@ -161,6 +166,7 @@ export function createNodeServerStorage(dataDir) {
         id: row.id,
         position: row.position,
         package: JSON.parse(row.package_json),
+        clientId: row.client_id || null,
       }))
     },
 
