@@ -48,7 +48,8 @@ On disk:
 ```text
 <dataDir>/current
 <dataDir>/subjects/<encoded-subject>/pointer
-<dataDir>/subjects/<encoded-subject>/outbox.jsonl
+<dataDir>/subjects/<encoded-subject>/incoming/
+<dataDir>/subjects/<encoded-subject>/inflight/
 <dataDir>/subjects/<encoded-subject>/attachments/
 ```
 
@@ -56,7 +57,7 @@ That directory set is the list `{ subject, pointer }`. No second index.
 
 `applyChange` is per subject. Two roots are two local trees.
 
-`appendChanges` queues on **current**. If current moves away, unsent work stays in the old outbox until that subject is current again.
+`appendChanges` queues on **current** and returns when the file is in that subject's `incoming/` directory. See [B1](./B1-syncbridge-client-send.md). If current moves away, unsent work stays in the old `incoming/` and `inflight/` directories until that subject is current again.
 
 ## 4. Pointer rule
 

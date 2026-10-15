@@ -1,4 +1,6 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { once } from "node:events"
+import http from "node:http"
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import Database from "better-sqlite3"
@@ -348,6 +350,142 @@ function createRobotClient({ dataDir, url, log }) {
 
 function steps(events) {
   return events.map((event) => event.step)
+}
+
+test("e2e: a later append lands in a new incoming queue after the previous one becomes inflight", async (t) => {
+  const dirs = await tempDirs(t)
+  const gates = [createGate(), createGate(), createGate()]
+  const server = createSyncServer({ dataDir: dirs.server })
+  t.after(() => server.close())
+  const endpoints = await listenHeld(server, t, gates)
+  server.init(subjectA, async () => {})
+  const client = createSyncClient({ dataDir: dirs.client, url: endpoints.url })
+  await client.use(subjectA, async () => {})
+  await client.appendChanges({ data: "original" })
+  const syncing = client.sync()
+  const digest = subjectDigest(subjectA)
+  const root = path.join(dirs.client, "subjects", digest)
+
+  await gates[0].started
+  assert.deepEqual(await queueData(path.join(root, "inflight")), ["original"])
+  assert.deepEqual(await queueData(path.join(root, "incoming")), [])
+  await client.appendChanges({ data: "a1" })
+  await client.appendChanges({ data: "a2" })
+  assert.deepEqual(await queueData(path.join(root, "inflight")), ["original"])
+  assert.deepEqual(await queueData(path.join(root, "incoming")), ["a1", "a2"])
+  gates[0].release()
+
+  await gates[1].started
+  assert.deepEqual(await queueData(path.join(root, "inflight")), ["a1", "a2"])
+  assert.deepEqual(await queueData(path.join(root, "incoming")), [])
+  await client.appendChanges({ data: "b1" })
+  await client.appendChanges({ data: "b2" })
+  assert.deepEqual(await queueData(path.join(root, "inflight")), ["a1", "a2"])
+  assert.deepEqual(await queueData(path.join(root, "incoming")), ["b1", "b2"])
+  gates[1].release()
+
+  await gates[2].started
+  assert.deepEqual(await queueData(path.join(root, "inflight")), ["b1", "b2"])
+  assert.deepEqual(await queueData(path.join(root, "incoming")), [])
+  gates[2].release()
+
+  const synced = await syncing
+  await server.whenIdle()
+  assert.equal(synced.status, "succeed")
+  assert.deepEqual(logData(dirs.server), ["original", "a1", "a2", "b1", "b2"])
+  assert.deepEqual(await client.outbox(), [])
+})
+
+test("e2e: a restart sends the remaining inflight row and every incoming change", async (t) => {
+  const dirs = await tempDirs(t)
+  let trap = null
+  let entered
+  const started = new Promise((resolve) => { entered = resolve })
+  const server = createSyncServer({ dataDir: dirs.server })
+  t.after(() => server.close())
+  const endpoints = await listenOnce(server, t, {
+    capture(req) {
+      trap = req
+      entered()
+    },
+  })
+  server.init(subjectA, async () => {})
+  const client = createSyncClient({ dataDir: dirs.client, url: endpoints.url })
+  await client.use(subjectA, async () => {})
+  await client.appendChanges({ data: "kept" })
+  const syncing = client.sync()
+  const digest = subjectDigest(subjectA)
+  const root = path.join(dirs.client, "subjects", digest)
+  await started
+  await client.appendChanges({ data: "photo" })
+  assert.deepEqual(await queueData(path.join(root, "inflight")), ["kept"])
+  assert.deepEqual(await queueData(path.join(root, "incoming")), ["photo"])
+  trap.destroy()
+  await assert.rejects(syncing)
+
+  const restarted = createSyncClient({ dataDir: dirs.client, url: endpoints.url })
+  await restarted.use(subjectA, async () => {})
+  const synced = await restarted.sync()
+  await server.whenIdle()
+  assert.equal(synced.status, "succeed")
+  assert.deepEqual(logData(dirs.server), ["kept", "photo"])
+  assert.deepEqual(await restarted.outbox(), [])
+})
+
+function createGate() {
+  let release
+  let entered
+  return {
+    started: new Promise((resolve) => { entered = resolve }),
+    wait() {
+      entered()
+      return new Promise((resolve) => { release = resolve })
+    },
+    release() {
+      release()
+    },
+  }
+}
+
+async function listenHeld(syncServer, t, gates) {
+  const pending = [...gates]
+  const server = http.createServer(async (req, res) => {
+    if (req.method === "POST" && pending.length > 0) await pending.shift().wait()
+    syncServer.handle(req, res)
+  })
+  server.listen(0, "127.0.0.1")
+  await once(server, "listening")
+  t.after(() => new Promise((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()))
+  }))
+  return { url: `http://127.0.0.1:${server.address().port}/sync` }
+}
+
+async function listenOnce(syncServer, t, trap) {
+  let captured = false
+  const server = http.createServer((req, res) => {
+    if (req.method === "POST" && !captured) {
+      captured = true
+      trap.capture(req)
+      return
+    }
+    syncServer.handle(req, res)
+  })
+  server.listen(0, "127.0.0.1")
+  await once(server, "listening")
+  t.after(() => new Promise((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()))
+  }))
+  return { url: `http://127.0.0.1:${server.address().port}/sync` }
+}
+
+async function queueData(directory) {
+  const names = (await readdir(directory)).filter((name) => name.endsWith(".json")).sort()
+  const data = []
+  for (const name of names) {
+    data.push(JSON.parse(await readFile(path.join(directory, name), "utf8")).package.data)
+  }
+  return data
 }
 
 async function pointerOf(dataDir, subject) {

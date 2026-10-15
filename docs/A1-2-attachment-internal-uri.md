@@ -43,7 +43,8 @@ No `bytes` field. No `uri` field. No `name` field. No `attachments/` tree on the
 <dataDir>/current
 <dataDir>/subjects/<digest>/subject
 <dataDir>/subjects/<digest>/pointer
-<dataDir>/subjects/<digest>/outbox.jsonl    ← manifests including path
+<dataDir>/subjects/<digest>/incoming/       ← new manifests, including path
+<dataDir>/subjects/<digest>/inflight/       ← the batch sync is sending
 ```
 
 ```js

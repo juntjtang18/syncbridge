@@ -10,8 +10,9 @@ export function createNodeClientStorage(dataDir) {
       const digest = subjectDigest(subject)
       const directory = subjectDirectory(dataDir, digest)
       await mkdir(directory, { recursive: true })
+      await mkdir(queueDirectory(dataDir, digest, "incoming"), { recursive: true })
+      await mkdir(queueDirectory(dataDir, digest, "inflight"), { recursive: true })
       await writeIfMissing(path.join(directory, "pointer"), "0")
-      await writeIfMissing(path.join(directory, "outbox.jsonl"), "")
       await writeIfMissing(path.join(directory, "unprocessed.json"), "[]")
       await writeIfMissing(path.join(directory, "failures.json"), "[]")
       await writeIfMissing(path.join(directory, "subject"), subject)
@@ -64,28 +65,71 @@ export function createNodeClientStorage(dataDir) {
       await writeAtomic(pointerPath(dataDir, digest), String(position))
     },
 
+    async highestSeq(digest) {
+      await migrateLegacyOutbox(dataDir, digest)
+      const names = [
+        ...await listQueueNames(queueDirectory(dataDir, digest, "inflight")),
+        ...await listQueueNames(queueDirectory(dataDir, digest, "incoming")),
+      ]
+      let highest = 0
+      for (const name of names) highest = Math.max(highest, seqOf(name))
+      return highest
+    },
+
+    async appendIncoming(digest, record, seq) {
+      await migrateLegacyOutbox(dataDir, digest)
+      await writeQueueFile(queueDirectory(dataDir, digest, "incoming"), seq, record)
+    },
+
+    async claimInflight(digest) {
+      await migrateLegacyOutbox(dataDir, digest)
+      const inflightDir = queueDirectory(dataDir, digest, "inflight")
+      const pending = await readQueue(inflightDir)
+      if (pending.length > 0) return pending
+      const incomingDir = queueDirectory(dataDir, digest, "incoming")
+      await mkdir(inflightDir, { recursive: true })
+      for (const name of await listQueueNames(incomingDir)) {
+        await rename(path.join(incomingDir, name), path.join(inflightDir, name))
+      }
+      return readQueue(inflightDir)
+    },
+
+    async readInflight(digest) {
+      await migrateLegacyOutbox(dataDir, digest)
+      return readQueue(queueDirectory(dataDir, digest, "inflight"))
+    },
+
     async readOutbox(digest) {
-      const text = await readFile(outboxPath(dataDir, digest), "utf8")
-      if (text.length === 0) return []
-      return text.trim().split("\n").map((line) => JSON.parse(line))
+      await migrateLegacyOutbox(dataDir, digest)
+      return [
+        ...await readQueue(queueDirectory(dataDir, digest, "inflight")),
+        ...await readQueue(queueDirectory(dataDir, digest, "incoming")),
+      ]
     },
 
-    async appendOutbox(digest, record) {
-      const file = outboxPath(dataDir, digest)
-      const current = await readFile(file, "utf8")
-      const next = current.length === 0 || current.endsWith("\n") ? current : `${current}\n`
-      await writeAtomic(file, `${next}${JSON.stringify(record)}\n`)
+    async writeInflight(digest, record) {
+      const directory = queueDirectory(dataDir, digest, "inflight")
+      const name = await findQueueName(directory, record.id)
+      if (!name) throw new Error(`inflight entry is missing: ${record.id}`)
+      await writeAtomic(path.join(directory, name), JSON.stringify(record))
     },
 
-    async writeOutbox(digest, records) {
-      const text = records.length === 0 ? "" : `${records.map((record) => JSON.stringify(record)).join("\n")}\n`
-      await writeAtomic(outboxPath(dataDir, digest), text)
-    },
-
-    async removeOutbox(digest, ids) {
+    async removeInflight(digest, ids) {
       const drop = new Set(ids)
-      const records = await this.readOutbox(digest)
-      await this.writeOutbox(digest, records.filter((record) => !drop.has(record.id)))
+      const directory = queueDirectory(dataDir, digest, "inflight")
+      for (const name of await listQueueNames(directory)) {
+        const record = JSON.parse(await readFile(path.join(directory, name), "utf8"))
+        if (drop.has(record.id)) await rm(path.join(directory, name), { force: true })
+      }
+    },
+
+    async replaceOutbox(digest, records) {
+      await rm(legacyOutboxPath(dataDir, digest), { force: true })
+      await clearQueue(queueDirectory(dataDir, digest, "inflight"))
+      await clearQueue(queueDirectory(dataDir, digest, "incoming"))
+      for (let index = 0; index < records.length; index += 1) {
+        await writeQueueFile(queueDirectory(dataDir, digest, "incoming"), index + 1, records[index])
+      }
     },
 
     async putBlob(digest, expectedHash, bytes) {
@@ -200,8 +244,76 @@ function pointerPath(dataDir, digest) {
   return path.join(subjectDirectory(dataDir, digest), "pointer")
 }
 
-function outboxPath(dataDir, digest) {
+function queueDirectory(dataDir, digest, name) {
+  return path.join(subjectDirectory(dataDir, digest), name)
+}
+
+function legacyOutboxPath(dataDir, digest) {
   return path.join(subjectDirectory(dataDir, digest), "outbox.jsonl")
+}
+
+function queueFileName(seq, id) {
+  return `${String(seq).padStart(10, "0")}-${id}.json`
+}
+
+function seqOf(name) {
+  const seq = Number(name.slice(0, name.indexOf("-")))
+  return Number.isInteger(seq) ? seq : 0
+}
+
+async function listQueueNames(directory) {
+  let names
+  try {
+    names = await readdir(directory)
+  } catch (error) {
+    if (error.code === "ENOENT") return []
+    throw error
+  }
+  return names.filter((name) => name.endsWith(".json") && !name.startsWith(".")).sort()
+}
+
+async function readQueue(directory) {
+  const records = []
+  for (const name of await listQueueNames(directory)) {
+    records.push(JSON.parse(await readFile(path.join(directory, name), "utf8")))
+  }
+  return records
+}
+
+async function findQueueName(directory, id) {
+  for (const name of await listQueueNames(directory)) {
+    const record = JSON.parse(await readFile(path.join(directory, name), "utf8"))
+    if (record.id === id) return name
+  }
+  return null
+}
+
+async function writeQueueFile(directory, seq, record) {
+  await mkdir(directory, { recursive: true })
+  await writeAtomic(path.join(directory, queueFileName(seq, record.id)), JSON.stringify(record))
+}
+
+async function clearQueue(directory) {
+  await mkdir(directory, { recursive: true })
+  for (const name of await listQueueNames(directory)) {
+    await rm(path.join(directory, name), { force: true })
+  }
+}
+
+async function migrateLegacyOutbox(dataDir, digest) {
+  const file = legacyOutboxPath(dataDir, digest)
+  let text
+  try {
+    text = await readFile(file, "utf8")
+  } catch (error) {
+    if (error.code === "ENOENT") return
+    throw error
+  }
+  const lines = text.trim() ? text.trim().split("\n") : []
+  for (let index = 0; index < lines.length; index += 1) {
+    await writeQueueFile(queueDirectory(dataDir, digest, "inflight"), index + 1, JSON.parse(lines[index]))
+  }
+  await rm(file, { force: true })
 }
 
 function unprocessedPath(dataDir, digest) {

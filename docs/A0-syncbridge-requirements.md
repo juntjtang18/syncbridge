@@ -3,7 +3,8 @@
 **Status:** 2026-10-06  
 **Design:** [A1](./A1-syncbridge-highlevel-design.md)  
 **Changing subject:** [A1-1](./A1-1-syncbridge-changing-subject.md)  
-**Attachment pointer:** [A1-2](./A1-2-attachment-internal-uri.md)
+**Attachment pointer:** [A1-2](./A1-2-attachment-internal-uri.md)  
+**Client send:** [B1](./B1-syncbridge-client-send.md)
 
 SyncBridge is client-server middleware for synchronizing opaque application changes.
 
@@ -28,7 +29,7 @@ SyncBridge is client-server middleware for synchronizing opaque application chan
 11. The platform creates a client with a persistent `dataDir` and a transport `send` function. One client holds many subjects and one current subject.
 12. The client API is `use(subject, applyChange, { readAttachment })`, `current()`, `subjects()`, `sync()`, `appendChanges(package)`, `failedEntries()`, and `whenIdle()`. `use` creates the subject if new, reuses its pointer if known, and sets current. `sync` and `appendChanges` apply to current only. `readAttachment(manifest)` is the host callback that streams bytes for an outbox `path` when sending.
 13. SyncBridge owns, per subject, the client's pointer, outbox, unprocessed queue, and failure list inside its `dataDir`. It also persists which subject is current and a stable `clientId`. Attachment temps live in `dataDir` only until a successful local apply deletes them.
-14. `appendChanges` queues a local change on the current subject without requiring a network connection. Unsent work stays on that subject's outbox if current moves away.
+14. `appendChanges` queues a local change on the current subject without requiring a network connection. It returns when the change is stored in that subject's `incoming/` directory, including while `sync()` is still running. Unsent work stays in `incoming/` or `inflight/` if current moves away. The handoff is [B1](./B1-syncbridge-client-send.md).
 15. `sync()` happens only when the application calls it; SyncBridge does not poll.
 16. `sync()` blocks until the `POST /sync` ack and until each downloaded entry and its attachment bytes are saved locally. It does not wait for server `applyChange` or for the client's own `applyChange`. The pointer means received through here. It moves when the entry is saved, including an entry the sender gave up after 3 failure acks. Apply does not move it again.
 16a. Every `POST /sync` response includes the host's live `subject` and a `status`. The client compares `subject` to the one it sent. If they differ, the client `use`s the live subject and returns `{ status: "switched", switched: true, subject }`. `PUT /sync` streams bytes and returns `{ sha256, size }`. A known write or hash problem returns `{ status: "failed", error }`. An unexpected PUT throw returns `{ status: "error", error }`. `GET /sync?sha256=` reads the in-flight PUT temp. After that temp is deleted, the same GET streams the live subject's `readAttachment` for the log manifest with that hash. A missing blob is HTTP 404. The changelog stores `path`, not a URL.

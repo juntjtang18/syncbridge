@@ -8,8 +8,9 @@ export function createExpoClientStorage(dataDir, { sha256, subjectDigest, random
       const digest = await subjectDigest(subject)
       directory(subjectDirectory(digest)).create({ intermediates: true, idempotent: true })
       directory(attachmentsDirectory(digest)).create({ intermediates: true, idempotent: true })
+      directory(queueDirectory(digest, "incoming")).create({ intermediates: true, idempotent: true })
+      directory(queueDirectory(digest, "inflight")).create({ intermediates: true, idempotent: true })
       await writeIfMissing(pointerPath(digest), "0")
-      await writeIfMissing(outboxPath(digest), "")
       await writeIfMissing(unprocessedPath(digest), "[]")
       await writeIfMissing(failuresPath(digest), "[]")
       await writeIfMissing(`${subjectDirectory(digest)}/subject`, subject)
@@ -50,30 +51,72 @@ export function createExpoClientStorage(dataDir, { sha256, subjectDigest, random
       await writeAtomic(pointerPath(digest), String(position))
     },
 
+    async highestSeq(digest) {
+      await migrateLegacyOutbox(digest)
+      const names = [
+        ...listQueueNames(queueDirectory(digest, "inflight")),
+        ...listQueueNames(queueDirectory(digest, "incoming")),
+      ]
+      let highest = 0
+      for (const name of names) highest = Math.max(highest, seqOf(name))
+      return highest
+    },
+
+    async appendIncoming(digest, record, seq) {
+      await migrateLegacyOutbox(digest)
+      await writeQueueFile(queueDirectory(digest, "incoming"), seq, record)
+    },
+
+    async claimInflight(digest) {
+      await migrateLegacyOutbox(digest)
+      const inflightDir = queueDirectory(digest, "inflight")
+      const pending = await readQueue(inflightDir)
+      if (pending.length > 0) return pending
+      const incomingDir = queueDirectory(digest, "incoming")
+      directory(inflightDir).create({ intermediates: true, idempotent: true })
+      for (const name of listQueueNames(incomingDir)) {
+        new File(`${incomingDir}/${name}`).move(new File(`${inflightDir}/${name}`))
+      }
+      return readQueue(inflightDir)
+    },
+
+    async readInflight(digest) {
+      await migrateLegacyOutbox(digest)
+      return readQueue(queueDirectory(digest, "inflight"))
+    },
+
     async readOutbox(digest) {
-      const text = await new File(outboxPath(digest)).text()
-      if (text.length === 0) return []
-      return text.trim().split("\n").map((line) => JSON.parse(line))
+      await migrateLegacyOutbox(digest)
+      return [
+        ...await readQueue(queueDirectory(digest, "inflight")),
+        ...await readQueue(queueDirectory(digest, "incoming")),
+      ]
     },
 
-    async appendOutbox(digest, record) {
-      const file = outboxPath(digest)
-      const current = await new File(file).text()
-      const next = current.length === 0 || current.endsWith("\n") ? current : `${current}\n`
-      await writeAtomic(file, `${next}${JSON.stringify(record)}\n`)
+    async writeInflight(digest, record) {
+      const dir = queueDirectory(digest, "inflight")
+      const name = await findQueueName(dir, record.id)
+      if (!name) throw new Error(`inflight entry is missing: ${record.id}`)
+      await writeAtomic(`${dir}/${name}`, JSON.stringify(record))
     },
 
-    async writeOutbox(digest, records) {
-      const text = records.length === 0 ? "" : `${records.map((record) => JSON.stringify(record)).join("\n")}\n`
-      await writeAtomic(outboxPath(digest), text)
-    },
-
-    async removeOutbox(digest, ids) {
+    async removeInflight(digest, ids) {
       const drop = new Set(ids)
-      const records = await this.readOutbox(digest)
-      const kept = records.filter((record) => !drop.has(record.id))
-      const text = kept.length === 0 ? "" : `${kept.map((record) => JSON.stringify(record)).join("\n")}\n`
-      await writeAtomic(outboxPath(digest), text)
+      const dir = queueDirectory(digest, "inflight")
+      for (const name of listQueueNames(dir)) {
+        const record = JSON.parse(await new File(`${dir}/${name}`).text())
+        if (drop.has(record.id)) new File(`${dir}/${name}`).delete()
+      }
+    },
+
+    async replaceOutbox(digest, records) {
+      const legacy = new File(legacyOutboxPath(digest))
+      if (legacy.exists) legacy.delete()
+      clearQueue(queueDirectory(digest, "inflight"))
+      clearQueue(queueDirectory(digest, "incoming"))
+      for (let index = 0; index < records.length; index += 1) {
+        await writeQueueFile(queueDirectory(digest, "incoming"), index + 1, records[index])
+      }
     },
 
     async putBlob(digest, expectedHash, bytes) {
@@ -169,7 +212,61 @@ export function createExpoClientStorage(dataDir, { sha256, subjectDigest, random
   function subjectDirectory(digest) { return `${root}/subjects/${digest}` }
   function attachmentsDirectory(digest) { return `${subjectDirectory(digest)}/attachments` }
   function pointerPath(digest) { return `${subjectDirectory(digest)}/pointer` }
-  function outboxPath(digest) { return `${subjectDirectory(digest)}/outbox.jsonl` }
+  function queueDirectory(digest, name) { return `${subjectDirectory(digest)}/${name}` }
+  function legacyOutboxPath(digest) { return `${subjectDirectory(digest)}/outbox.jsonl` }
+  function queueFileName(seq, id) { return `${String(seq).padStart(10, "0")}-${id}.json` }
+  function seqOf(name) {
+    const seq = Number(name.slice(0, name.indexOf("-")))
+    return Number.isInteger(seq) ? seq : 0
+  }
+
+  function listQueueNames(dirPath) {
+    const dir = directory(dirPath)
+    if (!dir.exists) return []
+    const names = []
+    for (const entry of dir.list()) {
+      const name = String(entry.uri).split("/").pop()
+      if (name.endsWith(".json") && !name.startsWith(".")) names.push(name)
+    }
+    return names.sort()
+  }
+
+  async function readQueue(dirPath) {
+    const records = []
+    for (const name of listQueueNames(dirPath)) {
+      records.push(JSON.parse(await new File(`${dirPath}/${name}`).text()))
+    }
+    return records
+  }
+
+  async function findQueueName(dirPath, id) {
+    for (const name of listQueueNames(dirPath)) {
+      const record = JSON.parse(await new File(`${dirPath}/${name}`).text())
+      if (record.id === id) return name
+    }
+    return null
+  }
+
+  async function writeQueueFile(dirPath, seq, record) {
+    directory(dirPath).create({ intermediates: true, idempotent: true })
+    await writeAtomic(`${dirPath}/${queueFileName(seq, record.id)}`, JSON.stringify(record))
+  }
+
+  function clearQueue(dirPath) {
+    directory(dirPath).create({ intermediates: true, idempotent: true })
+    for (const name of listQueueNames(dirPath)) new File(`${dirPath}/${name}`).delete()
+  }
+
+  async function migrateLegacyOutbox(digest) {
+    const file = new File(legacyOutboxPath(digest))
+    if (!file.exists) return
+    const text = await file.text()
+    const lines = text.trim() ? text.trim().split("\n") : []
+    for (let index = 0; index < lines.length; index += 1) {
+      await writeQueueFile(queueDirectory(digest, "inflight"), index + 1, JSON.parse(lines[index]))
+    }
+    file.delete()
+  }
   function unprocessedPath(digest) { return `${subjectDirectory(digest)}/unprocessed.json` }
   function failuresPath(digest) { return `${subjectDirectory(digest)}/failures.json` }
   function blobPath(digest, hash) { return `${attachmentsDirectory(digest)}/${hash}` }

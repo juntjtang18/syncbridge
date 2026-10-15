@@ -25,6 +25,7 @@ export function createClient({ storage, transport, sha256, randomId, log }) {
   let drain = Promise.resolve()
   let queueLock = Promise.resolve()
   const draining = new Set()
+  const seqByDigest = new Map()
 
   function withQueue(work) {
     const run = queueLock.then(work, work)
@@ -178,16 +179,15 @@ export function createClient({ storage, transport, sha256, randomId, log }) {
     },
 
     outbox() {
-      return exclusive(async () => {
-        ready()
-        return storage.readOutbox(digest)
-      })
+      ready()
+      return storage.readOutbox(digest)
     },
 
     setOutbox(records) {
       return exclusive(async () => {
         ready()
-        await storage.writeOutbox(digest, normalizeOutbox(records))
+        await storage.replaceOutbox(digest, normalizeOutbox(records))
+        seqByDigest.delete(digest)
       })
     },
 
@@ -212,14 +212,20 @@ export function createClient({ storage, transport, sha256, randomId, log }) {
     whenIdle,
 
     appendChanges(input) {
-      return exclusive(async () => {
+      try {
         ready()
+        const targetDigest = digest
+        const targetSubject = subject
         const prepared = preparePackage(input)
         const record = { id: randomId(), package: prepared.package, attempts: 0 }
-        await storage.appendOutbox(digest, record)
-        trace(sink, { side: "client", subject, step: "append", id: record.id })
-        return { id: record.id }
-      })
+        return takeSeq(targetDigest).then(async (seq) => {
+          await storage.appendIncoming(targetDigest, record, seq)
+          trace(sink, { side: "client", subject: targetSubject, step: "append", id: record.id })
+          return { id: record.id }
+        })
+      } catch (error) {
+        return Promise.reject(error)
+      }
     },
 
     sync() {
@@ -228,13 +234,13 @@ export function createClient({ storage, transport, sha256, randomId, log }) {
         const clientId = await storage.ensureClientId()
         let pulled = false
         for (;;) {
-          const all = await storage.readOutbox(digest)
-          const batch = selectBatch(all)
+          const inflight = await storage.claimInflight(digest)
+          const batch = selectBatch(inflight)
           if (batch.length === 0 && pulled) return { status: "succeed", subject }
           if (batch.length > 0) {
             try {
               await fillHashes(batch, readAttachment, transport, sink, subject)
-              await storage.writeOutbox(digest, replaceBatch(all, batch))
+              for (const row of batch) await storage.writeInflight(digest, row)
             } catch (error) {
               trace(sink, { side: "client", subject, step: "put", id: batch[0]?.id, status: "failed", error: messageOf(error) })
               const capped = await failSend(storage, digest, batch[0], messageOf(error), sink, subject)
@@ -297,7 +303,7 @@ export function createClient({ storage, transport, sha256, randomId, log }) {
           if (!Array.isArray(response.acceptedIds) || !Array.isArray(response.entries)) {
             throw new TypeError("sync response is invalid")
           }
-          await storage.removeOutbox(digest, response.acceptedIds)
+          await storage.removeInflight(digest, response.acceptedIds)
           await ingest(response, {
             storage, transport, digest, clientId, subject, withQueue, log: sink,
             wake: () => wake(digest, applyChange),
@@ -323,6 +329,32 @@ export function createClient({ storage, transport, sha256, randomId, log }) {
 
   function ready() {
     if (!subject) throw new Error("client is not initialized")
+  }
+
+  function takeSeq(targetDigest) {
+    let box = seqByDigest.get(targetDigest)
+    if (!box) {
+      let open
+      const gate = new Promise((resolve) => { open = resolve })
+      box = { next: 0, failed: null, chain: gate }
+      seqByDigest.set(targetDigest, box)
+      storage.highestSeq(targetDigest).then((highest) => {
+        box.next = highest + 1
+        open()
+      }, (error) => {
+        box.failed = error
+        seqByDigest.delete(targetDigest)
+        open()
+      })
+    }
+    const run = box.chain.then(() => {
+      if (box.failed) throw box.failed
+      const seq = box.next
+      box.next += 1
+      return seq
+    })
+    box.chain = run.then(() => {}, () => {})
+    return run
   }
 }
 
@@ -387,20 +419,14 @@ function selectBatch(records) {
   return records.slice(0, heldIndex + 1)
 }
 
-function replaceBatch(all, batch) {
-  const byId = new Map(batch.map((row) => [row.id, row]))
-  return all.map((row) => byId.get(row.id) || row)
-}
-
 async function failSend(storage, digest, record, detail, log, subject) {
   if (!record) return false
-  const all = await storage.readOutbox(digest)
-  const index = all.findIndex((row) => row.id === record.id)
-  if (index === -1) return false
-  const attempts = (all[index].attempts || 0) + 1
+  const inflight = await storage.readInflight(digest)
+  const found = inflight.find((row) => row.id === record.id)
+  if (!found) return false
+  const attempts = (found.attempts || 0) + 1
   if (attempts < ATTEMPT_LIMIT) {
-    all[index] = { ...all[index], attempts }
-    await storage.writeOutbox(digest, all)
+    await storage.writeInflight(digest, { ...found, attempts })
     trace(log, { side: "client", subject, step: "send", id: record.id, attempt: attempts, error: detail })
     return false
   }
@@ -412,7 +438,7 @@ async function failSend(storage, digest, record, detail, log, subject) {
     failedAt: new Date().toISOString(),
   })
   await storage.writeFailures(digest, failures)
-  await storage.removeOutbox(digest, [record.id])
+  await storage.removeInflight(digest, [record.id])
   trace(log, {
     side: "client",
     subject,

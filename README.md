@@ -2,7 +2,8 @@
 
 Requirements: [docs/A0-syncbridge-requirements.md](./docs/A0-syncbridge-requirements.md)  
 Design: [docs/A1-syncbridge-highlevel-design.md](./docs/A1-syncbridge-highlevel-design.md)  
-Changing subject: [docs/A1-1-syncbridge-changing-subject.md](./docs/A1-1-syncbridge-changing-subject.md)
+Changing subject: [docs/A1-1-syncbridge-changing-subject.md](./docs/A1-1-syncbridge-changing-subject.md)  
+Client send: [docs/B1-syncbridge-client-send.md](./docs/B1-syncbridge-client-send.md)
 
 ## Difficulties of a sync system
 
@@ -183,7 +184,9 @@ await client.whenIdle()
 
 `client.failedEntries()` is the list for the current subject. Send rows say `send failed after 3 attempts: …`. Apply rows say `apply failed after 3 attempts: …`.
 
-The host reads and replaces a queue directly. On the phone, `outbox()` and `setOutbox(records)` are the upload buffer. `unprocessed()` and `setUnprocessed(records)` are the local apply queue. `setUnprocessed` wakes the worker. On the server, `unprocessed(subject)` and `setUnprocessed(subject, records)` are that subject's apply queue. A record is `{ id, package, attempts }` for the outbox, and `{ id, position, package, attempts }` for the unprocessed queue. `package` is `{ data, attachments }`.
+`appendChanges` writes the change into `incoming/` and returns as soon as that file is on disk. It does not wait for a `sync()` that is already running. `sync()` sends `inflight/` and renames `incoming/` into `inflight/` only when `inflight/` is empty. A photo taken during `sync()` is still on disk if the app exits, and the next launch sends it. The rules are in [B1](./docs/B1-syncbridge-client-send.md).
+
+The host reads and replaces a queue directly. On the phone, `outbox()` reads `inflight/` then `incoming/` and does not wait for `sync()`. `setOutbox(records)` waits until the current `sync()` finishes, then replaces both directories. `unprocessed()` and `setUnprocessed(records)` are the local apply queue. `setUnprocessed` wakes the worker. On the server, `unprocessed(subject)` and `setUnprocessed(subject, records)` are that subject's apply queue. A record is `{ id, package, attempts }` for the upload buffer, and `{ id, position, package, attempts }` for the unprocessed queue. `package` is `{ data, attachments }`.
 
 7. Pass a `log` when the host wants a trace of each step. The host implements `{ write(event) }`. Syncbridge calls `write` and does not print the line itself. Omit `log` and the writes go nowhere. If `log` is passed, `write` must be a function. A throw inside `write` is ignored, so a broken logger cannot change the sync result. Apply lines that happen after `sync()` returns still call `write`.
 

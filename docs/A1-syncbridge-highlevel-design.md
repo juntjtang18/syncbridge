@@ -3,7 +3,8 @@
 **Status:** 2026-10-06  
 **Requirements:** [A0](./A0-syncbridge-requirements.md)  
 **Changing subject:** [A1-1](./A1-1-syncbridge-changing-subject.md)  
-**Attachment pointer:** [A1-2](./A1-2-attachment-internal-uri.md)
+**Attachment pointer:** [A1-2](./A1-2-attachment-internal-uri.md)  
+**Client send:** [B1](./B1-syncbridge-client-send.md)
 
 SyncBridge is middleware for client-server synchronization. It moves opaque change packages. The application decides what a package means and supplies `applyChange` to write that package into its business storage.
 
@@ -178,7 +179,8 @@ await client.use(subject, applyChange, { readAttachment })
 <dataDir>/client-id
 <dataDir>/current
 <dataDir>/subjects/<encoded-subject>/pointer
-<dataDir>/subjects/<encoded-subject>/outbox.jsonl
+<dataDir>/subjects/<encoded-subject>/incoming/
+<dataDir>/subjects/<encoded-subject>/inflight/
 <dataDir>/subjects/<encoded-subject>/unprocessed.json
 <dataDir>/subjects/<encoded-subject>/failures.json
 ```
@@ -201,7 +203,7 @@ whenIdle()       // current subject's unprocessed queue is empty
 
 `applyChange` is per subject. Two roots are two local trees. Do not reuse one callback that always writes the same directory.
 
-`appendChanges(changeLog)` adds a local change to the **current** subject's outgoing queue. It does not require a network connection. Unsent work stays in that subject's outbox if current moves away. It flushes only when that subject is current again and `sync()` runs.
+`appendChanges(changeLog)` adds a local change to the **current** subject's `incoming/` queue and returns when that file is on disk. It does not wait for `sync()`. The send rules are in [B1](./B1-syncbridge-client-send.md). Unsent work stays on that subject if current moves away. It flushes only when that subject is current again and `sync()` runs.
 
 `sync()` happens only when the app calls it; SyncBridge does not poll:
 

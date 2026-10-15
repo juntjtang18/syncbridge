@@ -46,7 +46,8 @@ test("init validates inputs and creates subject state without syncing", async (t
   assert.deepEqual(names, [digest])
   assert.equal(digest.includes(subject), false)
   assert.equal(await readFile(path.join(dirs.client, "subjects", digest, "pointer"), "utf8"), "0")
-  assert.equal(await readFile(path.join(dirs.client, "subjects", digest, "outbox.jsonl"), "utf8"), "")
+  assert.deepEqual(await readdir(path.join(dirs.client, "subjects", digest, "incoming")), [])
+  assert.deepEqual(await readdir(path.join(dirs.client, "subjects", digest, "inflight")), [])
   assert.equal(await readFile(path.join(dirs.client, "subjects", digest, "subject"), "utf8"), subject)
   assert.equal(await readFile(path.join(dirs.client, "current"), "utf8"), subject)
   await client.appendChanges({ data: { ok: true } })
@@ -104,7 +105,7 @@ test("two clients sync one subject through the server log", async (t) => {
 
   const digest = subjectDigest(subject)
   await assertNoClientStaging(dirs.clientA)
-  const outbox = await readFile(path.join(dirs.clientA, "subjects", digest, "outbox.jsonl"), "utf8")
+  const outbox = await queueText(path.join(dirs.clientA, "subjects", digest, "incoming"))
   assert.match(outbox, new RegExp(appended.id))
 
   await clientA.sync()
@@ -112,7 +113,8 @@ test("two clients sync one subject through the server log", async (t) => {
   await clientA.whenIdle()
   assert.equal(serverApplies, 1)
   assert.equal(await readFile(path.join(dirs.clientA, "subjects", digest, "pointer"), "utf8"), "1")
-  assert.equal(await readFile(path.join(dirs.clientA, "subjects", digest, "outbox.jsonl"), "utf8"), "")
+  assert.equal(await queueText(path.join(dirs.clientA, "subjects", digest, "incoming")), "")
+  assert.equal(await queueText(path.join(dirs.clientA, "subjects", digest, "inflight")), "")
   await assertNoServerStaging(dirs.server)
   await assertNoClientStaging(dirs.clientA)
 
@@ -238,9 +240,10 @@ test("use switches current and keeps the previous subject's pointer and outbox",
   assert.deepEqual(new Set(await client.subjects()), new Set([subject, other]))
   assert.equal(await readFile(path.join(dirs.client, "subjects", subjectDigest(other), "pointer"), "utf8"), "0")
   assert.equal(await readFile(path.join(dirs.client, "subjects", subjectDigest(subject), "pointer"), "utf8"), "1")
-  const outboxA = await readFile(path.join(dirs.client, "subjects", subjectDigest(subject), "outbox.jsonl"), "utf8")
+  const outboxA = await queueText(path.join(dirs.client, "subjects", subjectDigest(subject), "incoming"))
   assert.match(outboxA, /still-on-a/)
-  assert.equal(await readFile(path.join(dirs.client, "subjects", subjectDigest(other), "outbox.jsonl"), "utf8"), "")
+  assert.equal(await queueText(path.join(dirs.client, "subjects", subjectDigest(other), "incoming")), "")
+  assert.equal(await queueText(path.join(dirs.client, "subjects", subjectDigest(other), "inflight")), "")
 
   await client.use(subject, async () => {})
   assert.equal(await client.current(), subject)
@@ -346,19 +349,19 @@ test("a bad change is refused twice and the third send moves it to the client fa
   await client.init(subject, async () => {})
   const digest = subjectDigest(subject)
   const missing = "ab".repeat(32)
-  await storage.appendOutbox(digest, {
+  await storage.appendIncoming(digest, {
     id: "bad",
     attempts: 0,
     package: {
       data: "bad",
       attachments: [{ id: "a", path: "a.jpg", sha256: missing, size: 1 }],
     },
-  })
-  await storage.appendOutbox(digest, {
+  }, 1)
+  await storage.appendIncoming(digest, {
     id: "good",
     attempts: 0,
     package: { data: "good", attachments: [] },
-  })
+  }, 2)
   const first = await client.sync()
   assert.equal(first.status, "failed")
   assert.equal(server.failedEntries(subject).length, 0)
@@ -620,6 +623,37 @@ test("a host log receives each sync step and a missing log writes nowhere", asyn
   assert.equal(clientEvents[0].side, "client")
   assert.equal(typeof clientEvents[0].at, "string")
 })
+
+test("an existing outbox.jsonl is sent on the next sync", async (t) => {
+  const dirs = await tempDirs(t)
+  const server = createSyncServer({ dataDir: dirs.server })
+  t.after(() => server.close())
+  const endpoints = await listen(server, t)
+  server.init(subject, async () => {})
+  const client = createSyncClient({ dataDir: dirs.client, url: endpoints.url })
+  await client.init(subject, async () => {})
+  const digest = subjectDigest(subject)
+  const legacy = [
+    JSON.stringify({ id: "old-1", attempts: 0, package: { data: "first", attachments: [] } }),
+    JSON.stringify({ id: "old-2", attempts: 0, package: { data: "second", attachments: [] } }),
+  ].join("\n") + "\n"
+  await writeFile(path.join(dirs.client, "subjects", digest, "outbox.jsonl"), legacy)
+  const synced = await client.sync()
+  await server.whenIdle()
+  assert.equal(synced.status, "succeed")
+  const db = new Database(path.join(dirs.server, "syncbridge.sqlite"), { readonly: true })
+  const rows = db.prepare("SELECT package_json FROM log_entries ORDER BY position").all()
+  db.close()
+  assert.deepEqual(rows.map((row) => JSON.parse(row.package_json).data), ["first", "second"])
+  await assert.rejects(readFile(path.join(dirs.client, "subjects", digest, "outbox.jsonl"), "utf8"))
+})
+
+async function queueText(directory) {
+  const names = (await readdir(directory)).filter((name) => name.endsWith(".json")).sort()
+  const parts = []
+  for (const name of names) parts.push(await readFile(path.join(directory, name), "utf8"))
+  return parts.join("\n")
+}
 
 async function tempDirs(t) {
   const root = await mkdtemp(path.join(tmpdir(), "syncbridge-"))
