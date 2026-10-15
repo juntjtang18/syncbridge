@@ -4,6 +4,7 @@ import { requireSubject } from "./client-contracts.js"
 export {
   asBytes,
   createAttachmentReader,
+  hostPackage,
   persistedPackage,
   preparePackage,
   requireApplyChange,

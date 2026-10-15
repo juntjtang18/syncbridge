@@ -4,7 +4,7 @@ import {
   asBytes,
   createAttachmentReader,
   persistedPackage,
-  preparePackage,
+  hostPackage,
   randomId,
   requireApplyChange,
   requirePointer,
@@ -129,7 +129,7 @@ export function createServer({ storage, currentSubject, log }) {
       return exclusive(async () => {
         const key = requireSubject(subject)
         if (!callbacks.has(key)) throw new Error(`subject is not initialized: ${key}`)
-        const prepared = preparePackage(input)
+        const prepared = hostPackage(input)
         const id = randomId()
         const result = storage.appendEntry(key, id, prepared.package)
         trace(sink, { side: "server", subject: key, step: "append", id, detail: { position: result.position } })

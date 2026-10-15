@@ -78,6 +78,35 @@ export function preparePackage(input) {
   return { package: { data, attachments: manifests } }
 }
 
+export function hostPackage(input) {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) {
+    throw new TypeError("package must be an object")
+  }
+  if (!Object.hasOwn(input, "data")) throw new TypeError("package.data is required")
+  const data = jsonData(input.data)
+  const attachments = input.attachments ?? []
+  if (!Array.isArray(attachments)) throw new TypeError("package.attachments must be an array")
+
+  const ids = new Set()
+  const manifests = []
+  for (const attachment of attachments) {
+    if (attachment === null || typeof attachment !== "object" || Array.isArray(attachment)) {
+      throw new TypeError("attachment must be an object")
+    }
+    if (typeof attachment.id !== "string" || attachment.id.length === 0) {
+      throw new TypeError("attachment.id must be a non-empty string")
+    }
+    if (ids.has(attachment.id)) throw new TypeError(`duplicate attachment id ${attachment.id}`)
+    ids.add(attachment.id)
+    if (typeof attachment.path !== "string" || attachment.path.length === 0) {
+      throw new TypeError("attachment.path must be a non-empty string")
+    }
+    manifests.push(hostManifest(attachment))
+  }
+
+  return { package: { data, attachments: manifests } }
+}
+
 export function persistedPackage(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError("package must be an object")
@@ -147,6 +176,11 @@ function jsonData(data) {
   const parsed = JSON.parse(encoded)
   if (JSON.stringify(parsed) !== JSON.stringify(data)) throw new TypeError("package.data must be JSON")
   return parsed
+}
+
+function hostManifest(attachment) {
+  if (attachment.sha256 === undefined && attachment.size === undefined) return queuedManifest(attachment)
+  return loggedManifest(attachment)
 }
 
 function queuedManifest(attachment) {
