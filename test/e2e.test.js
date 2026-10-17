@@ -48,7 +48,7 @@ test("e2e: after changelog sync, a new unseen subject starts at pointer 0", asyn
   await client.whenIdle()
   assert.deepEqual(first, { status: "succeed", subject: subjectA })
   assert.equal(await pointerOf(dirs.client, subjectA), "2")
-  assert.equal(appliedA.length, 0)
+  assert.equal(appliedA.length, 2, "its own changes come back in log order")
   assert.deepEqual(logSubjects(dirs.server), [subjectA, subjectA])
 
   live = subjectB
@@ -57,7 +57,7 @@ test("e2e: after changelog sync, a new unseen subject starts at pointer 0", asyn
   assert.equal(await client.current(), subjectB)
   assert.equal(await pointerOf(dirs.client, subjectB), "0")
   assert.equal(await pointerOf(dirs.client, subjectA), "2")
-  assert.equal(appliedA.length, 0)
+  assert.equal(appliedA.length, 2)
   assert.deepEqual(logSubjects(dirs.server), [subjectA, subjectA])
 
   await client.use(subjectB, async (entry) => {
@@ -70,7 +70,7 @@ test("e2e: after changelog sync, a new unseen subject starts at pointer 0", asyn
   await client.whenIdle()
   assert.deepEqual(syncedB, { status: "succeed", subject: subjectB })
   assert.equal(await pointerOf(dirs.client, subjectB), "1")
-  assert.deepEqual(appliedB, [])
+  assert.deepEqual(appliedB, [{ object: "project", action: "add", id: "metro", name: "Metro Bridge" }])
   assert.deepEqual(logSubjects(dirs.server), [subjectA, subjectA, subjectB])
 })
 
@@ -115,7 +115,7 @@ test("e2e: after changelog sync, an old known subject reuses its pointer", async
   assert.equal(await client.current(), subjectA)
   assert.equal(await pointerOf(dirs.client, subjectA), "1")
   assert.equal(await pointerOf(dirs.client, subjectB), "1")
-  assert.deepEqual(appliedA, [])
+  assert.deepEqual(appliedA, [{ object: "project", action: "add", id: "harbor", name: "Harbor Yard" }])
 
   await client.use(subjectA, async (entry) => {
     appliedA.push(entry.package.data)
@@ -312,7 +312,7 @@ test("e2e: a robot client records the host log for a sync and a failed apply", a
   const synced = await robot.syncChange(subjectA, { poi: "north-wall" })
   await server.whenIdle()
   assert.equal(synced.status, "succeed")
-  assert.deepEqual(steps(robotLog), ["append", "post", "ack", "pointer"])
+  assert.deepEqual(steps(robotLog), ["append", "post", "ack", "enqueue", "save", "pointer", "apply", "applied"])
   assert.deepEqual(steps(serverLog), ["post", "enqueue", "ack", "apply", "applied"])
   assert.equal(robotLog.find((event) => event.step === "ack").status, "succeed")
   assert.equal(robotLog[0].side, "client")
@@ -329,7 +329,8 @@ test("e2e: a robot client records the host log for a sync and a failed apply", a
   assert.match(applyFailures[2].error, /apply failed/)
   assert.equal(applyFailures[2].attempt, 3)
   assert.ok(robotLog.some((event) => event.step === "ack" && event.status === "succeed"))
-  assert.equal(robotLog.some((event) => event.step === "applied"), false)
+  // The robot replays its own logged change like any other; only the server's apply failed.
+  assert.equal(robotLog.some((event) => event.step === "applied"), true)
 })
 
 function createRobotClient({ dataDir, url, log }) {
@@ -349,7 +350,7 @@ function steps(events) {
   return events.map((event) => event.step)
 }
 
-test("e2e: uploaded changes are skipped on the way down in the same sync", async (t) => {
+test("e2e: uploaded changes come back in log order in the same sync, without their attachments", async (t) => {
   const dirs = await tempDirs(t)
   const server = createSyncServer({ dataDir: dirs.server })
   t.after(() => server.close())
@@ -386,10 +387,11 @@ test("e2e: uploaded changes are skipped on the way down in the same sync", async
   const sentIds = posts[0].body.changes.map((change) => change.id)
   assert.deepEqual(sentIds, [first.id, second.id])
   assert.deepEqual(posts[0].response.acceptedIds, sentIds)
-  assert.deepEqual(posts[0].response.entries, [])
-  assert.deepEqual(posts[0].response.echoed.map((row) => row.id), sentIds)
-  assert.deepEqual(posts[0].response.echoed.map((row) => row.position), [1, 2])
-  assert.deepEqual(applied, [])
+  assert.deepEqual(posts[0].response.entries.map((row) => [row.id, row.position, row.own, row.package.attachments]), [
+    [first.id, 1, true, []],
+    [second.id, 2, true, []],
+  ])
+  assert.deepEqual(applied, ["one", "two"])
   assert.equal(await pointerOf(dirs.client, subjectA), "2")
   assert.deepEqual(logData(dirs.server), ["one", "two"])
 
@@ -407,7 +409,7 @@ test("e2e: uploaded changes are skipped on the way down in the same sync", async
   assert.equal(await pointerOf(path.join(path.dirname(dirs.client), "client-b"), subjectA), "2")
 })
 
-test("e2e: the client that uploaded a change does not download it", async (t) => {
+test("e2e: the client that uploaded a change gets it back without downloading its bytes", async (t) => {
   const dirs = await tempDirs(t)
   const photo = Buffer.from("own-photo")
   const store = createHostStore([["shot.jpg", photo]])
@@ -438,7 +440,7 @@ test("e2e: the client that uploaded a change does not download it", async (t) =>
   await receiver.appendChanges({ data: "first" })
   await receiver.sync()
   await receiver.whenIdle()
-  assert.deepEqual(receiverApplied, [])
+  assert.deepEqual(receiverApplied, [{ data: "first", bytes: null }])
   assert.equal(await pointerOf(receiverDir, subjectA), "1")
 
   let senderGets = 0
@@ -467,19 +469,19 @@ test("e2e: the client that uploaded a change does not download it", async (t) =>
   await sender.sync()
   await sender.whenIdle()
   await server.whenIdle()
-  assert.deepEqual(senderApplied, ["first"])
-  assert.equal(senderGets, 0)
+  assert.deepEqual(senderApplied, ["first", "photo"])
+  assert.equal(senderGets, 0, "its own photo bytes are not downloaded")
   assert.equal(await pointerOf(dirs.client, subjectA), "2")
 
   await receiver.sync()
   await receiver.whenIdle()
-  assert.deepEqual(receiverApplied, [{ data: "photo", bytes: photo }])
+  assert.deepEqual(receiverApplied, [{ data: "first", bytes: null }, { data: "photo", bytes: photo }])
   assert.equal(await pointerOf(receiverDir, subjectA), "2")
 
   await server.appendChanges(subjectA, { data: "from-server" })
   await sender.sync()
   await sender.whenIdle()
-  assert.deepEqual(senderApplied, ["first", "from-server"])
+  assert.deepEqual(senderApplied, ["first", "photo", "from-server"])
   assert.equal(senderGets, 0)
   assert.equal(await pointerOf(dirs.client, subjectA), "3")
 

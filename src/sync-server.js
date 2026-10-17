@@ -302,7 +302,7 @@ async function handlePost(req, storage, callbacks, currentSubject, wake, log) {
 
   const delivery = clientId
     ? deliveryFor(storage, subject, pointer, clientId)
-    : { skipped: [], echoed: [], entries: storage.entriesAfter(subject, pointer).map(publicEntry) }
+    : { skipped: [], entries: storage.entriesAfter(subject, pointer).map(publicEntry) }
   const seen = new Set(skipped.map((item) => item.id))
   for (const item of delivery.skipped) {
     if (!seen.has(item.id)) skipped.push(item)
@@ -325,7 +325,6 @@ async function handlePost(req, storage, callbacks, currentSubject, wake, log) {
       ...emptyAck(failure ? (acceptedIds.length > 0 ? "partial" : "failed") : "succeed", subject),
       acceptedIds,
       entries: delivery.entries,
-      echoed: delivery.echoed,
       skipped,
       ...(failure ? { error: failure.message } : {}),
     },
@@ -384,12 +383,13 @@ function noteReceiveFailure(storage, subject, clientId, failure, log) {
 function deliveryFor(storage, subject, pointer, clientId) {
   const rows = storage.entriesAfter(subject, pointer)
   const skipped = []
-  const echoed = []
   const entries = []
   let retry = null
   for (const row of rows) {
+    // This client's own change comes back in log order so every copy replays the same log, but
+    // without its attachments: the bytes are already on that client.
     if (row.clientId && row.clientId === clientId) {
-      echoed.push({ id: row.id, position: row.position })
+      entries.push({ ...publicEntry(row), package: { ...row.package, attachments: [] }, own: true })
       continue
     }
     if (storage.sendFailure(subject, clientId, row.id)) {
@@ -403,8 +403,8 @@ function deliveryFor(storage, subject, pointer, clientId) {
     }
     entries.push(publicEntry(row))
   }
-  if (retry) return { skipped, echoed, entries: [publicEntry(retry)] }
-  return { skipped, echoed, entries }
+  if (retry) return { skipped, entries: [...entries.filter((entry) => entry.own), publicEntry(retry)] }
+  return { skipped, entries }
 }
 
 function publicEntry(row) {
@@ -505,7 +505,7 @@ function queuePackage(value) {
 }
 
 function emptyAck(status, subject) {
-  return { status, subject, acceptedIds: [], entries: [], attachmentHashes: [], skipped: [], echoed: [] }
+  return { status, subject, acceptedIds: [], entries: [], attachmentHashes: [], skipped: [] }
 }
 
 function optionalClientId(value) {
@@ -604,7 +604,6 @@ function writeAckError(res, error) {
     entries: [],
     attachmentHashes: [],
     skipped: [],
-    echoed: [],
   })
 }
 

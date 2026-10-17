@@ -275,7 +275,7 @@ test("a live subject change does not write the old log and reuses a known pointe
   const first = await client.sync()
   await client.whenIdle()
   assert.deepEqual(first, { status: "succeed", subject })
-  assert.deepEqual(appliedA, [])
+  assert.deepEqual(appliedA, ["on-a"])
   assert.equal(await readFile(path.join(dirs.client, "subjects", subjectDigest(subject), "pointer"), "utf8"), "1")
 
   live = liveB
@@ -284,7 +284,7 @@ test("a live subject change does not write the old log and reuses a known pointe
   assert.equal(await client.current(), liveB)
   assert.equal(await readFile(path.join(dirs.client, "subjects", subjectDigest(liveB), "pointer"), "utf8"), "0")
   assert.equal(await readFile(path.join(dirs.client, "subjects", subjectDigest(subject), "pointer"), "utf8"), "1")
-  assert.deepEqual(appliedA, [])
+  assert.deepEqual(appliedA, ["on-a"])
   const db = new Database(path.join(dirs.server, "syncbridge.sqlite"), { readonly: true })
   const rows = db.prepare("SELECT subject, package_json FROM log_entries").all()
   db.close()
@@ -299,7 +299,7 @@ test("a live subject change does not write the old log and reuses a known pointe
   await client.whenIdle()
   assert.deepEqual(syncedB, { status: "succeed", subject: liveB })
   assert.equal(await readFile(path.join(dirs.client, "subjects", subjectDigest(liveB), "pointer"), "utf8"), "1")
-  assert.deepEqual(appliedB, [])
+  assert.deepEqual(appliedB, ["on-b"])
 
   live = subject
   const back = await client.sync()
@@ -617,7 +617,7 @@ test("a host log receives each sync step and a missing log writes nowhere", asyn
   await server.whenIdle()
   await client.whenIdle()
   assert.equal(synced.status, "succeed")
-  assert.deepEqual(clientEvents.map((event) => event.step), ["append", "post", "pointer"])
+  assert.deepEqual(clientEvents.map((event) => event.step), ["append", "post", "enqueue", "save", "pointer", "apply", "applied"])
   assert.deepEqual(serverEvents.map((event) => event.step), ["post", "enqueue", "ack", "apply", "applied"])
   assert.equal(serverEvents[0].side, "server")
   assert.equal(clientEvents[0].side, "client")

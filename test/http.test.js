@@ -70,7 +70,6 @@ test("handle stages a stream and applies the posted change on any host path", as
     entries: [],
     attachmentHashes: [],
     skipped: [],
-    echoed: [],
     subject,
   })
   assert.equal(applies, 1)
@@ -142,7 +141,6 @@ test("POST echoes the live subject and refuses a stale one", async (t) => {
     entries: [],
     attachmentHashes: [],
     skipped: [],
-    echoed: [],
   })
 })
 

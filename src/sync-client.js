@@ -65,7 +65,7 @@ export function createClient({ storage, transport, sha256, randomId, log }) {
     trace(sink, { side: "client", subject: loggedSubject, step: "apply", id: row.id, attempt, detail: { position: row.position } })
     try {
       const applied = await callback(
-        { id: row.id, position: row.position, package: row.package },
+        { id: row.id, position: row.position, package: row.package, ...(row.own ? { own: true } : {}) },
         createAttachmentReader(row.package.attachments || [], async (manifest) => {
           return storage.readBlob(targetDigest, manifest.sha256)
         }, sha256),
@@ -381,7 +381,7 @@ function normalizeUnprocessed(records) {
     if (!Number.isInteger(record.position) || record.position < 1) throw new TypeError("unprocessed position is invalid")
     const attempts = record.attempts ?? 0
     if (!Number.isInteger(attempts) || attempts < 0) throw new TypeError("unprocessed attempts is invalid")
-    return { id: record.id, position: record.position, package: queuePackage(record.package), attempts }
+    return { id: record.id, position: record.position, package: queuePackage(record.package), attempts, ...(record.own === true ? { own: true } : {}) }
   })
 }
 
@@ -513,30 +513,6 @@ async function ingest(response, context) {
       entries = Array.isArray(ack.entries) ? ack.entries : []
     }
   }
-  await advanceEcho(context, response.echoed)
-}
-
-async function advanceEcho(context, echoed) {
-  if (!Array.isArray(echoed) || echoed.length === 0) return
-  const positions = echoed
-    .filter((item) => item && Number.isInteger(item.position))
-    .map((item) => item.position)
-    .sort((left, right) => left - right)
-  let pointer = await context.storage.readPointer(context.digest)
-  for (const position of positions) {
-    if (position <= pointer) continue
-    if (position !== pointer + 1) break
-    pointer = position
-  }
-  const current = await context.storage.readPointer(context.digest)
-  if (pointer === current) return
-  await context.storage.writePointer(context.digest, pointer)
-  trace(context.log, {
-    side: "client",
-    subject: context.subject,
-    step: "pointer",
-    detail: { position: pointer, echoed: true },
-  })
 }
 
 async function saveReceived(context, entry) {
@@ -549,7 +525,7 @@ async function saveReceived(context, entry) {
   await context.withQueue(async () => {
     const rows = await context.storage.readUnprocessed(context.digest)
     if (rows.some((row) => row.id === entry.id)) return
-    rows.push({ id: entry.id, position: entry.position, package: entry.package, attempts: 0 })
+    rows.push({ id: entry.id, position: entry.position, package: entry.package, attempts: 0, ...(entry.own ? { own: true } : {}) })
     await context.storage.writeUnprocessed(context.digest, rows)
     trace(context.log, {
       side: "client",

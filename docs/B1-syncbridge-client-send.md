@@ -49,7 +49,7 @@ The loop claims again after a pass. A photo saved while this `sync()` is open go
 
 The POST body is `{ subject, pointer, changes, clientId }`. `clientId` is a random id for this install. The first `sync()` writes it to `<dataDir>/client-id` when that file is missing or empty, and later syncs read the same file. One id covers every subject on this `dataDir`. SyncBridge creates it. The host does not pass it in.
 
-The server stores that id on each log row this install appends. Those rows come back as `echoed` positions, not as `entries`. This client moves its pointer across the contiguous echoed positions and does not download them or call `applyChange`. Another install has a different `client-id` file, so it still receives the rows. The same id is how the server counts a failed download for this install only: three failures skip that entry here, and other installs still receive it.
+The server stores that id on each log row this install appends. Those rows come back as entries in log order with `own: true` and no attachments: this client downloads nothing for them and calls `applyChange` like for any other entry, so it replays the same log as every other copy. Another install has a different `client-id` file, so it receives the rows with their attachments. The same id is how the server counts a failed download for this install only: three failures skip that entry here, and other installs still receive it.
 
 ## 4. Host queue
 

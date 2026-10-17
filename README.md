@@ -186,7 +186,7 @@ await client.whenIdle()
 
 `appendChanges` writes the change into `incoming/` and returns as soon as that file is on disk. It does not wait for a `sync()` that is already running. `sync()` sends `inflight/` and renames `incoming/` into `inflight/` only when `inflight/` is empty. A photo taken during `sync()` is still on disk if the app exits, and the next launch sends it. The rules are in [B1](./docs/B1-syncbridge-client-send.md).
 
-A change this phone uploads is skipped on the way down in that same `sync()`. The first `sync()` writes a random `clientId` to `dataDir/client-id` when the file is missing or empty. Later syncs send that same id with `subject`, `pointer`, and `changes`. The host does not choose it. One file covers every subject on this `dataDir`. The server stores the id on each log row this install appends. Those rows come back as `echoed` positions, not as `entries`. This phone moves its pointer across them and does not call `applyChange`. Another phone has its own `client-id` file, so it still receives the rows and applies them. A change the server writes with `appendChanges` has no `clientId`, so every phone downloads it.
+A change this phone uploads comes back to it in log order, without its attachments, so every copy replays the same log and the last change logged wins everywhere. The first `sync()` writes a random `clientId` to `dataDir/client-id` when the file is missing or empty. Later syncs send that same id with `subject`, `pointer`, and `changes`. The host does not choose it. One file covers every subject on this `dataDir`. The server stores the id on each log row this install appends. Those rows come back as entries with `own: true` and an empty `attachments` list: the bytes are already on this phone, so nothing is downloaded, and `applyChange` gets the entry with `own: true`. Another phone has its own `client-id` file, so it receives the rows with their attachments. A change the server writes with `appendChanges` has no `clientId`, so every phone downloads it.
 
 The host reads and replaces a queue directly. On the phone, `outbox()` reads `inflight/` then `incoming/` and does not wait for `sync()`. `setOutbox(records)` waits until the current `sync()` finishes, then replaces both directories. `unprocessed()` and `setUnprocessed(records)` are the local apply queue. `setUnprocessed` wakes the worker. On the server, `unprocessed(subject)` and `setUnprocessed(subject, records)` are that subject's apply queue. A record is `{ id, package, attempts }` for the upload buffer, and `{ id, position, package, attempts }` for the unprocessed queue. `package` is `{ data, attachments }`.
 
@@ -227,7 +227,7 @@ Each event is `{ at, side, subject, step, id, attempt, status, error, detail }`.
 | `ack` | The response status is known: `succeed`, `partial`, `failed`, `error`, or `switched`. |
 | `enqueue` | A saved entry is placed on the apply queue. |
 | `save` | The phone has stored a downloaded entry. |
-| `pointer` | The phone moved its pointer. `detail.echoed` is true when the move skipped rows this phone uploaded. |
+| `pointer` | The phone moved its pointer. |
 | `send` | A send failed and the attempt is still under 3. |
 | `send-failed` | The third send failure was recorded. |
 | `receive-failed` | The phone could not save a downloaded entry. |

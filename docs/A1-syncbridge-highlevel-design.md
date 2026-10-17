@@ -191,7 +191,7 @@ await client.use(subject, applyChange, { readAttachment })
 
 That directory set is the persisted list `{ subject, pointer }`. There is no second index. A subject this client has never seen gets `pointer` `0`: every server log entry is new. A subject this client has seen keeps its file. Changing current does not rewrite another subject's pointer.
 
-`<dataDir>/client-id` is this install's `clientId`. The first `sync()` writes a random id there when the file is missing or empty, and every `POST /sync` sends that same id. One file covers every subject. A new `dataDir` gets a new id. The host does not choose it. The server stores it on each log row this install appends, and returns those positions in `echoed` so this client can move its pointer without downloading them. The send and echo rules are in [B1](./B1-syncbridge-client-send.md).
+`<dataDir>/client-id` is this install's `clientId`. The first `sync()` writes a random id there when the file is missing or empty, and every `POST /sync` sends that same id. One file covers every subject. A new `dataDir` gets a new id. The host does not choose it. The server stores it on each log row this install appends, and returns those rows to this client with `own: true` and no attachments. The send rules are in [B1](./B1-syncbridge-client-send.md).
 
 The public client API is:
 
@@ -225,11 +225,10 @@ sync:
     persist current + first-seen pointer 0
     return { status: "switched", switched: true, subject: live }
 
-  for each entry after the saved pointer that this client did not append:
+  for each entry after the saved pointer (its own come with own: true and no attachments):
     save the log entry and the attachment temps
     on success, enqueue unprocessed, save the pointer, wake the worker
     on failure, post receiveFailed and stop; the server resends or skips
-  move the pointer across echoed positions this client appended, with no download and no apply
   return after that save; the worker applies later
 ```
 
@@ -242,7 +241,7 @@ The host application owns the live root (the configured driver folder). SyncBrid
 On every `POST /sync` — the call that already names a subject — the **host** puts the live subject on the response:
 
 ```js
-{ status, acceptedIds, entries, attachmentHashes, skipped, echoed, subject }
+{ status, acceptedIds, entries, attachmentHashes, skipped, subject }
 ```
 
 `subject` is always the live root, not “the one the client sent.” The extra string is cheap next to attachments. `PUT` and `GET` of raw attachment bytes do not carry a subject.
@@ -280,7 +279,7 @@ When a client sends `{ subject, pointer, changes, clientId }`, and the host says
 1. Opens that subject's log (`changelog0` for that subject only).
 2. Appends each new client change once, stores the request `clientId` on that log row, enqueues it, and assigns its position. A duplicate id is accepted and not appended again. `clientId` is the string in the client's `<dataDir>/client-id`.
 3. Acks `succeed`, `partial`, or `failed` without calling `applyChange`. A refused change is not stored and is not written to the failure list.
-4. Returns records after `pointer` that this `clientId` did not append, plus `echoed` positions for the ones it did, plus `skipped` ids this client has already given up, plus the live `subject`. The client moves its pointer past a contiguous run of echoed positions and does not download or apply them. Other clients still receive those rows.
+4. Returns records after `pointer` in log order, plus `skipped` ids this client has already given up, plus the live `subject`. A record this `clientId` appended comes with `own: true` and no attachments; the client applies it without downloading anything. Other clients receive those rows with their attachments.
 5. Wakes the worker. The worker drains the unprocessed queue outside the request lock.
 
 `receiveFailed` for a `clientId` increments that send attempt. Below 3, the next response repeats that entry and does not include later ones. At 3, the server writes `send failed after 3 attempts: …` for that client and continues with the next log entry. Other clients still receive the row.
