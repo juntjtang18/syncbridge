@@ -52,6 +52,9 @@ export function createNodeServerStorage(dataDir) {
   if (!logColumns.some((column) => column.name === "client_id")) {
     db.exec("ALTER TABLE log_entries ADD COLUMN client_id TEXT")
   }
+  if (!logColumns.some((column) => column.name === "base_position")) {
+    db.exec("ALTER TABLE log_entries ADD COLUMN base_position INTEGER")
+  }
 
   const selectById = db.prepare("SELECT position FROM log_entries WHERE subject = ? AND id = ?")
   const selectEntry = db.prepare("SELECT package_json FROM log_entries WHERE subject = ? AND id = ?")
@@ -59,15 +62,22 @@ export function createNodeServerStorage(dataDir) {
   const insertCounter = db.prepare("INSERT INTO subject_counters (subject, next_position) VALUES (?, ?)")
   const updateCounter = db.prepare("UPDATE subject_counters SET next_position = ? WHERE subject = ?")
   const insertEntry = db.prepare(
-    "INSERT INTO log_entries (subject, position, id, package_json, client_id) VALUES (?, ?, ?, ?, ?)",
+    "INSERT INTO log_entries (subject, position, id, package_json, client_id, base_position) VALUES (?, ?, ?, ?, ?, ?)",
   )
   const updatePackage = db.prepare("UPDATE log_entries SET package_json = ? WHERE subject = ? AND id = ?")
   const selectAfter = db.prepare(`
-    SELECT id, position, package_json, client_id
+    SELECT id, position, package_json, client_id, base_position
     FROM log_entries
     WHERE subject = ? AND position > ?
     ORDER BY position ASC
   `)
+  const selectBetween = db.prepare(`
+    SELECT id, position, package_json, client_id, base_position
+    FROM log_entries
+    WHERE subject = ? AND position > ? AND position < ?
+    ORDER BY position ASC
+  `)
+  const selectOrigin = db.prepare("SELECT client_id, base_position FROM log_entries WHERE subject = ? AND id = ?")
   const selectTip = db.prepare("SELECT MAX(position) AS position FROM log_entries WHERE subject = ?")
   const deleteEntry = db.prepare("DELETE FROM log_entries WHERE subject = ? AND id = ? AND position = ?")
   const selectPackages = db.prepare(`
@@ -130,14 +140,14 @@ export function createNodeServerStorage(dataDir) {
     UPDATE send_attempts SET attempts = ? WHERE subject = ? AND client_id = ? AND id = ?
   `)
 
-  const append = db.transaction((subject, id, packageValue, clientId) => {
+  const append = db.transaction((subject, id, packageValue, clientId, base) => {
     const existing = selectById.get(subject, id)
     if (existing) return { duplicate: true, position: existing.position }
     const counter = selectCounter.get(subject)
     const position = counter ? counter.next_position : 1
     if (counter) updateCounter.run(position + 1, subject)
     else insertCounter.run(subject, position + 1)
-    insertEntry.run(subject, position, id, JSON.stringify(packageValue), clientId || null)
+    insertEntry.run(subject, position, id, JSON.stringify(packageValue), clientId || null, Number.isInteger(base) ? base : null)
     return { duplicate: false, position }
   })
 
@@ -153,8 +163,19 @@ export function createNodeServerStorage(dataDir) {
   }
 
   return {
-    appendEntry(subject, id, packageValue, clientId) {
-      return append(subject, id, packageValue, clientId)
+    // `base` is the sender's pointer when it sent the change: the last position it had seen.
+    appendEntry(subject, id, packageValue, clientId, base) {
+      return append(subject, id, packageValue, clientId, base)
+    },
+
+    entryOrigin(subject, id) {
+      const row = selectOrigin.get(subject, id)
+      if (!row) return { clientId: null, base: null }
+      return { clientId: row.client_id || null, base: Number.isInteger(row.base_position) ? row.base_position : null }
+    },
+
+    entriesBetween(subject, after, before) {
+      return selectBetween.all(subject, after, before).map(logRow)
     },
 
     hasEntry(subject, id) {
@@ -162,12 +183,7 @@ export function createNodeServerStorage(dataDir) {
     },
 
     entriesAfter(subject, pointer) {
-      return selectAfter.all(subject, pointer).map((row) => ({
-        id: row.id,
-        position: row.position,
-        package: JSON.parse(row.package_json),
-        clientId: row.client_id || null,
-      }))
+      return selectAfter.all(subject, pointer).map(logRow)
     },
 
     findAttachment(subject, hash) {
@@ -358,4 +374,14 @@ function attachmentError(code, message) {
   const error = new Error(message)
   error.code = code
   return error
+}
+
+function logRow(row) {
+  return {
+    id: row.id,
+    position: row.position,
+    package: JSON.parse(row.package_json),
+    clientId: row.client_id || null,
+    base: Number.isInteger(row.base_position) ? row.base_position : null,
+  }
 }

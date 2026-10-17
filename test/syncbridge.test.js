@@ -648,6 +648,88 @@ test("an existing outbox.jsonl is sent on the next sync", async (t) => {
   await assert.rejects(readFile(path.join(dirs.client, "subjects", digest, "outbox.jsonl"), "utf8"))
 })
 
+test("the server apply learns who sent each change and what that sender had seen", async (t) => {
+  const dirs = await tempDirs(t)
+  const applied = []
+  const server = createSyncServer({ dataDir: dirs.server, currentSubject() { return subject } })
+  t.after(() => server.close())
+  const endpoints = await listen(server, t)
+  server.init(subject, async (entry) => {
+    applied.push({ data: entry.package.data, clientId: entry.clientId, base: entry.base })
+  })
+  const clientA = createSyncClient({ dataDir: dirs.clientA, url: endpoints.url })
+  const clientB = createSyncClient({ dataDir: dirs.clientB, url: endpoints.url })
+  await clientA.init(subject, async () => {})
+  await clientB.init(subject, async () => {})
+
+  await clientA.appendChanges({ data: { note: "from A" } })
+  await clientA.sync()
+  await server.whenIdle()
+  await clientB.appendChanges({ data: { note: "from B, before seeing A" } })
+  await clientB.sync()
+  await server.whenIdle()
+  await clientA.sync()
+  await clientA.whenIdle()
+  await clientA.appendChanges({ data: { note: "from A, after B" } })
+  await clientA.sync()
+  await server.whenIdle()
+
+  const [first, fromB, third] = applied
+  assert.equal(first.base, 0)
+  assert.equal(fromB.base, 0, "B had seen nothing when it sent")
+  assert.notEqual(fromB.clientId, first.clientId)
+  assert.equal(third.base, 2, "A had seen B by then")
+  assert.deepEqual(
+    server.entriesBetween(subject, fromB.base, 2).map((entry) => [entry.position, entry.package.data.note, entry.clientId]),
+    [[1, "from A", first.clientId]],
+  )
+})
+
+test("a host append with apply runs through the server apply in log order and resolves once applied", async (t) => {
+  const dirs = await tempDirs(t)
+  const applied = []
+  const server = createSyncServer({ dataDir: dirs.server, currentSubject() { return subject } })
+  t.after(() => server.close())
+  const endpoints = await listen(server, t)
+  server.init(subject, async (entry) => {
+    if (entry.package.data.note === "refuse") throw new Error("not allowed")
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    applied.push({ note: entry.package.data.note, clientId: entry.clientId, base: entry.base })
+  })
+
+  const recorded = await server.appendChanges(subject, { data: { note: "recorded only" } })
+  const result = await server.appendChanges(subject, { data: { note: "from the web" } }, { apply: true })
+  assert.deepEqual(applied, [{ note: "from the web", clientId: null, base: null }], "resolved after the apply finished")
+  assert.equal(result.position, recorded.position + 1)
+  await assert.rejects(server.appendChanges(subject, { data: { note: "refuse" } }, { apply: true }), /apply failed after 3 attempts: not allowed/)
+  await assert.rejects(
+    server.appendChanges(subject, { data: { note: "photo" }, attachments: [{ id: "a", path: "a.jpg" }] }, { apply: true }),
+    /carries no attachments/,
+  )
+
+  const client = createSyncClient({ dataDir: dirs.client, url: endpoints.url })
+  const received = []
+  await client.init(subject, async (entry) => { received.push(entry.package.data.note) })
+  await client.sync()
+  await client.whenIdle()
+  assert.deepEqual(received, ["recorded only", "from the web", "refuse"], "every host append reaches clients, applied or not")
+})
+
+test("a server log made before the base column opens and keeps appending", async (t) => {
+  const dirs = await tempDirs(t)
+  await mkdir(dirs.server, { recursive: true })
+  const old = new Database(path.join(dirs.server, "syncbridge.sqlite"))
+  old.exec(`CREATE TABLE log_entries (subject TEXT NOT NULL, position INTEGER NOT NULL, id TEXT NOT NULL, package_json TEXT NOT NULL, client_id TEXT, UNIQUE (subject, position), UNIQUE (subject, id));
+    CREATE TABLE subject_counters (subject TEXT PRIMARY KEY, next_position INTEGER NOT NULL);`)
+  old.prepare("INSERT INTO subject_counters (subject, next_position) VALUES (?, 2)").run(subject)
+  old.prepare("INSERT INTO log_entries (subject, position, id, package_json, client_id) VALUES (?, 1, 'old-1', ?, NULL)").run(subject, JSON.stringify({ data: { note: "old" }, attachments: [] }))
+  old.close()
+  const storage = createNodeServerStorage(dirs.server)
+  assert.deepEqual(storage.entryOrigin(subject, "old-1"), { clientId: null, base: null })
+  storage.appendEntry(subject, "new-2", { data: { note: "new" }, attachments: [] }, "client-x", 1)
+  assert.deepEqual(storage.entriesAfter(subject, 0).map((entry) => [entry.id, entry.base]), [["old-1", null], ["new-2", 1]])
+})
+
 async function queueText(directory) {
   const names = (await readdir(directory)).filter((name) => name.endsWith(".json")).sort()
   const parts = []

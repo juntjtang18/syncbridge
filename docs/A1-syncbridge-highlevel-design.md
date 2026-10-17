@@ -99,6 +99,10 @@ The package passed to `appendChanges` supplies `{ id, path, contentType }` per a
 
 SyncServer owns the log mechanics: assigning positions, keeping order, and returning records after a position. It does not store a pointer for any client.
 
+Each change a client sends is logged with its `clientId` and its `base`: the pointer that client posted with it, the last position it had seen. The server apply receives `{ id, position, package, clientId, base }`. `entriesBetween(subject, base, position)` lists the changes logged after `base` and before `position`, each with its `clientId`, so a host can tell which changes that sender had not seen and keep a newer field instead of overwriting it with an older copy. This is a record per change, not a stored pointer per client.
+
+A host append (`appendChanges` on the server) is logged for clients and not applied, because the host already made the change. `appendChanges(subject, input, { apply: true })` instead has the server apply make it, through the same serial apply and in log order with client changes, and resolves once it is applied or rejects with the apply error. It carries no attachments. Its `clientId` and `base` are `null`: the host is current when it writes.
+
 ## 3. Attachments
 
 See [A1-2](./A1-2-attachment-internal-uri.md). SyncBridge does not keep a durable blob store. `path` is the host pointer. The sender streams through `readAttachment`. The server apply of that upload reads the in-flight PUT temp. A later receiver downloads with `GET /sync?sha256=`, and the server streams the stored file through its `readAttachment`.

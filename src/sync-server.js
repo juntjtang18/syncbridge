@@ -22,6 +22,7 @@ export function createServer({ storage, currentSubject, log }) {
     throw new TypeError("currentSubject must be a function")
   }
   const callbacks = new Map()
+  const waiting = new Map()
   const sink = createLog(log)
   let tail = Promise.resolve()
   let drain = Promise.resolve()
@@ -58,14 +59,16 @@ export function createServer({ storage, currentSubject, log }) {
     trace(sink, { side: "server", subject: row.subject, step: "apply", id: row.id, attempt, detail: { position: row.position } })
     try {
       if (!registered?.applyChange) throw new Error(`subject is not initialized: ${row.subject}`)
+      const origin = storage.entryOrigin(row.subject, row.id)
       const applied = await registered.applyChange(
-        { id: row.id, position: row.position, package: row.package },
+        { id: row.id, position: row.position, package: row.package, clientId: origin.clientId, base: origin.base },
         readerFor(storage, row.package.attachments),
       )
       if (applied?.attachments) storage.updateAttachmentPaths(row.subject, row.id, applied.attachments)
       for (const manifest of row.package.attachments || []) storage.dropBlob(manifest.sha256)
       storage.removeUnprocessed(row.subject, row.id)
       trace(sink, { side: "server", subject: row.subject, step: "applied", id: row.id, attempt })
+      settle(row.subject, row.id, null)
     } catch (error) {
       const attempts = row.attempts + 1
       trace(sink, {
@@ -92,7 +95,21 @@ export function createServer({ storage, currentSubject, log }) {
         failedAt: new Date().toISOString(),
       })
       storage.removeUnprocessed(row.subject, row.id)
+      settle(row.subject, row.id, new Error(`apply failed after 3 attempts: ${messageOf(error)}`))
     }
+  }
+
+  function settle(subject, id, error) {
+    const key = `${subject}\n${id}`
+    const waiter = waiting.get(key)
+    if (!waiter) return
+    waiting.delete(key)
+    if (error) waiter.reject(error)
+    else waiter.resolve()
+  }
+
+  function whenApplied(subject, id) {
+    return new Promise((resolve, reject) => waiting.set(`${subject}\n${id}`, { resolve, reject }))
   }
 
   function whenIdle() {
@@ -125,16 +142,36 @@ export function createServer({ storage, currentSubject, log }) {
       })
     },
 
-    appendChanges(subject, input) {
+    // A host append is logged for clients and not applied: the host already made the change.
+    // With { apply: true } the server's own apply makes it, in log order with client changes, and
+    // the call resolves once applied (or rejects with the apply error). It carries no attachments.
+    appendChanges(subject, input, { apply = false } = {}) {
       return exclusive(async () => {
         const key = requireSubject(subject)
         if (!callbacks.has(key)) throw new Error(`subject is not initialized: ${key}`)
         const prepared = preparePackage(input)
+        if (apply && prepared.package.attachments.length > 0) {
+          throw new TypeError("an applied host append carries no attachments")
+        }
         const id = randomId()
         const result = storage.appendEntry(key, id, prepared.package)
-        trace(sink, { side: "server", subject: key, step: "append", id, detail: { position: result.position } })
-        return { id, position: result.position }
+        if (apply) storage.enqueueUnprocessed(key, result.position, id, prepared.package)
+        trace(sink, { side: "server", subject: key, step: "append", id, detail: { position: result.position, apply } })
+        return { id, position: result.position, applied: apply ? whenApplied(key, id) : null }
+      }).then(async ({ id, position, applied }) => {
+        if (applied) {
+          wake()
+          await applied
+        }
+        return { id, position }
       })
+    },
+
+    // The changes logged after `after` and before `before`, each with its sender's clientId:
+    // what a sender whose pointer was `after` had not seen when its change at `before` was logged.
+    entriesBetween(subject, after, before) {
+      return storage.entriesBetween(requireSubject(subject), requirePointer(after), requirePointer(before))
+        .map((row) => ({ id: row.id, position: row.position, package: row.package, clientId: row.clientId }))
     },
 
     failedEntries(subject) {
@@ -158,6 +195,10 @@ export function createServer({ storage, currentSubject, log }) {
     whenIdle,
 
     close() {
+      for (const [key, waiter] of waiting) {
+        waiting.delete(key)
+        waiter.reject(new Error("sync server closed before the change was applied"))
+      }
       stopped = true
       if (idle) {
         storage.close()
@@ -246,7 +287,7 @@ async function handlePost(req, storage, callbacks, currentSubject, wake, log) {
   let enqueued = false
   for (const change of changes) {
     try {
-      const stored = acceptChange(storage, subject, change, clientId)
+      const stored = acceptChange(storage, subject, change, clientId, pointer)
       if (stored.enqueued) {
         enqueued = true
         trace(log, { side: "server", subject, step: "enqueue", id: stored.id, detail: { position: stored.position } })
@@ -291,7 +332,7 @@ async function handlePost(req, storage, callbacks, currentSubject, wake, log) {
   }
 }
 
-function acceptChange(storage, subject, change, clientId) {
+function acceptChange(storage, subject, change, clientId, base) {
   if (change === null || typeof change !== "object") throw new TypeError("change must be an object")
   if (typeof change.id !== "string" || change.id.length === 0) {
     throw new TypeError("change.id must be a non-empty string")
@@ -306,7 +347,7 @@ function acceptChange(storage, subject, change, clientId) {
       throw attachmentFailure(error, manifest.id)
     }
   }
-  const result = storage.appendEntry(subject, change.id, packageValue, clientId || null)
+  const result = storage.appendEntry(subject, change.id, packageValue, clientId || null, base)
   if (result.duplicate) return { id: change.id, enqueued: false }
   storage.enqueueUnprocessed(subject, result.position, change.id, packageValue)
   return { id: change.id, position: result.position, enqueued: true }
