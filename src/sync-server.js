@@ -13,11 +13,14 @@ import {
   sha256,
 } from "./contracts.js"
 import { writeHashed } from "./hash-stream.js"
+import { SYNC_LIMITS } from "./limits.js"
 import { createLog, trace } from "./log.js"
 
 const ATTEMPT_LIMIT = 3
+// How far down the unprocessed queue the scheduler looks for changes it may start.
+const APPLY_WINDOW = 200
 
-export function createServer({ storage, currentSubject, log }) {
+export function createServer({ storage, currentSubject, log, applyConcurrency = SYNC_LIMITS.applyConcurrency }) {
   if (currentSubject !== undefined && typeof currentSubject !== "function") {
     throw new TypeError("currentSubject must be a function")
   }
@@ -45,12 +48,48 @@ export function createServer({ storage, currentSubject, log }) {
     })
   }
 
+  // Applies the unprocessed queue, up to `applyConcurrency` at once. The host's applyKey(entry)
+  // names what a change touches: changes with the same key apply one at a time in log order, and
+  // different keys may overlap. A change without a key waits for everything before it and runs
+  // alone. SyncBridge only compares keys; it never reads the change.
   async function pump() {
+    const running = new Map()
     while (!stopped) {
-      const row = storage.headUnprocessed()
-      if (!row) return
-      await applyRow(row)
+      for (const row of startable(storage.unprocessedHead(APPLY_WINDOW), running)) {
+        const done = applyRow(row).finally(() => running.delete(row.id))
+        running.set(row.id, { key: keyOf(row), done })
+      }
+      if (running.size === 0) return
+      await Promise.race([...running.values()].map((item) => item.done))
     }
+    // Stopped: let the applies already started finish before storage closes.
+    await Promise.allSettled([...running.values()].map((item) => item.done))
+  }
+
+  function keyOf(row) {
+    const applyKey = callbacks.get(row.subject)?.applyKey
+    const key = applyKey ? applyKey({ id: row.id, position: row.position, package: row.package }) : null
+    return typeof key === "string" && key.length > 0 ? `${row.subject}\n${key}` : null
+  }
+
+  // Rows to start now, oldest first: a keyed row whose key no earlier waiting or running row
+  // holds, or a keyless row when nothing runs and nothing is before it. Nothing passes a keyless row.
+  function startable(rows, running) {
+    const chosen = []
+    const held = new Set([...running.values()].map((item) => item.key))
+    for (const row of rows) {
+      if (running.size + chosen.length >= applyConcurrency) break
+      if (running.has(row.id)) continue
+      const key = keyOf(row)
+      if (key === null) {
+        if (running.size === 0 && chosen.length === 0 && held.size === 0) chosen.push(row)
+        break
+      }
+      if (held.has(key) || held.has(null)) { held.add(key); continue }
+      held.add(key)
+      chosen.push(row)
+    }
+    return chosen
   }
 
   async function applyRow(row) {
@@ -129,8 +168,10 @@ export function createServer({ storage, currentSubject, log }) {
       const key = requireSubject(subject)
       requireApplyChange(applyChange)
       const readAttachment = requireReadAttachment(options?.readAttachment)
+      const applyKey = options?.applyKey
+      if (applyKey !== undefined && typeof applyKey !== "function") throw new TypeError("applyKey must be a function")
       if (callbacks.has(key)) throw new Error(`subject already initialized: ${key}`)
-      callbacks.set(key, { applyChange, readAttachment })
+      callbacks.set(key, { applyChange, readAttachment, applyKey })
       wake()
     },
 

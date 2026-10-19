@@ -121,6 +121,12 @@ export function createNodeServerStorage(dataDir) {
     LIMIT 1
   `)
   const selectUnprocessedCount = db.prepare("SELECT COUNT(*) AS count FROM unprocessed")
+  const selectHeadRows = db.prepare(`
+    SELECT subject, position, id, package_json, attempts
+    FROM unprocessed
+    ORDER BY seq ASC
+    LIMIT ?
+  `)
   const updateAttempts = db.prepare("UPDATE unprocessed SET attempts = ? WHERE subject = ? AND id = ?")
   const deleteUnprocessed = db.prepare("DELETE FROM unprocessed WHERE subject = ? AND id = ?")
   const insertFailure = db.prepare(`
@@ -271,6 +277,17 @@ export function createNodeServerStorage(dataDir) {
 
     unprocessedCount(subject) {
       return countUnprocessed.get(subject).n
+    },
+
+    // The oldest unprocessed rows, in queue order, for the apply scheduler to choose from.
+    unprocessedHead(limit) {
+      return selectHeadRows.all(limit).map((row) => ({
+        subject: row.subject,
+        position: row.position,
+        id: row.id,
+        package: JSON.parse(row.package_json),
+        attempts: row.attempts,
+      }))
     },
 
     hasUnprocessed() {
