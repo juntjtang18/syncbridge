@@ -9,6 +9,8 @@ import { SYNC_LIMITS } from "./limits.js"
 import { createLog, trace } from "./log.js"
 
 const ATTEMPT_LIMIT = 3
+// Uploads the server lost, sent again within one sync() before it reports a failure.
+const REUPLOAD_LIMIT = 3
 
 export function createClient({ storage, transport, sha256, randomId, log, sendBatch = SYNC_LIMITS.sendBatch, receivePage = SYNC_LIMITS.receivePage }) {
   if (typeof sha256 !== "function") throw new TypeError("sha256 must be a function")
@@ -255,6 +257,7 @@ export function createClient({ storage, transport, sha256, randomId, log, sendBa
         const clientId = await storage.ensureClientId()
         let pulled = false
         let more = false
+        let reuploads = 0
         report({ sent: 0, uploaded: 0, toSend: (await storage.readOutbox(digest)).length, received: 0, toReceive: 0, applying: 0 })
         for (;;) {
           const inflight = await storage.claimInflight(digest)
@@ -353,8 +356,13 @@ export function createClient({ storage, transport, sha256, randomId, log, sendBa
               return { status: response.status, subject, error: response.error }
             }
             // The server lost the upload (another change with the same bytes was applied and its
-            // staging deleted): forget the hashes so the next attempt uploads the bytes again.
-            if (/ATTACHMENT_NOT_FOUND/.test(response.error || "")) await storage.writeInflight(digest, forgetHashes(rejected))
+            // staging deleted). Not the change's fault: forget its hashes and upload again now,
+            // without using an attempt, a few times per sync.
+            if (/ATTACHMENT_NOT_FOUND/.test(response.error || "") && reuploads < REUPLOAD_LIMIT) {
+              reuploads += 1
+              await storage.writeInflight(digest, forgetHashes(rejected))
+              continue
+            }
             const capped = await failSend(storage, digest, rejected, response.error || response.status, sink, subject)
             if (!capped) return { status: response.status, subject, error: response.error }
             continue

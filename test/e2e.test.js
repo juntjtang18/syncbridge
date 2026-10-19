@@ -741,13 +741,11 @@ test("e2e: an upload whose staging another client's apply deleted is uploaded ag
     await server.whenIdle()
     await assertNoServerStaging(dirs.server)
   }
-  const refused = await clientB.sync()
-  assert.equal(refused.status, "failed")
-  assert.match(refused.error, /ATTACHMENT_NOT_FOUND/)
-  // The next sync uploads the bytes again, and the change applies.
-  const retried = await clientB.sync()
+  // The server lost B's upload; the same sync uploads it again, without using an attempt.
+  const result = await clientB.sync()
   await server.whenIdle()
-  assert.equal(retried.status, "succeed")
+  assert.equal(result.status, "succeed")
+  assert.deepEqual(await clientB.failedEntries(), [])
   assert.deepEqual(applied, [["photo-a", "shared-photo"], ["photo-b", "shared-photo"]])
   await assertNoServerStaging(dirs.server)
 })

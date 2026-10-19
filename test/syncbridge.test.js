@@ -423,7 +423,8 @@ test("an attachment refusal names the reason, hash, size, and attachment id", as
   const missing = await client.sync()
   assert.equal(missing.status, "failed")
   const missingText = `ATTACHMENT_NOT_FOUND sha256 ${hash} attachment photo-1`
-  assert.equal(missing.error, missingText)
+  // A lost upload is sent again in the same sync; with no way to read the file here, that fails.
+  assert.equal(missing.error, "readAttachment is required")
   assert.equal(serverLog.find((event) => event.step === "ack").error, missingText)
   assert.equal(clientLog.find((event) => event.step === "ack").error, missingText)
 

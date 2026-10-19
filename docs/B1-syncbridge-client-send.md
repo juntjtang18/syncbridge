@@ -43,7 +43,7 @@ Two `sync()` calls still run one after another. Each pass claims `inflight`:
 
 `selectBatch` takes at most `sendBatch` rows (20), oldest first. A row with `attempts > 0` blocks later `inflight` rows. Those later rows stay in `inflight/`. New photos stay in `incoming/` until `inflight/` is empty.
 
-Each change's hash and size are written onto its claimed `inflight` file as soon as that change's attachments are up, before the next change uploads, so a stop part way re-uploads nothing already sent. A change refused with `ATTACHMENT_NOT_FOUND` has its hashes cleared on its `inflight` file, so its next attempt uploads again. These writes touch claimed `inflight` files only. Accepted ids delete those files. A send failure updates or deletes that one `inflight` file. None of these rewrite `incoming/`.
+Each change's hash and size are written onto its claimed `inflight` file as soon as that change's attachments are up, before the next change uploads, so a stop part way re-uploads nothing already sent. A change refused with `ATTACHMENT_NOT_FOUND` has its hashes cleared on its `inflight` file and is uploaded again in the same pass, up to 3 times per `sync()`, without counting an attempt. These writes touch claimed `inflight` files only. Accepted ids delete those files. A send failure updates or deletes that one `inflight` file. None of these rewrite `incoming/`.
 
 The loop claims again after a pass. A photo saved while this `sync()` is open goes out before `sync()` returns when the app stays up.
 
