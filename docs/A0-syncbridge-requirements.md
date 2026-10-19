@@ -42,12 +42,14 @@ log, in the same order. Applications apply each change; the last one logged wins
     is resent (its attachments uploaded afresh) up to 3 times; an entry that does not download intact
     or apply is retried 3 times. After the third failure it goes on `failures.json` and the sync moves
     on (for an entry, the pointer still moves past it). A network failure, or a 5xx answer (the server restarting
-    or busy), is not a try: `sync()` throws and the next sync resumes where it stopped.
+    or busy), is not a try: `sync()` throws and the next sync resumes where it stopped. A busy server's
+    503 carries `Retry-After`; the thrown error has it as `retryAfter` (seconds), so the app can wait
+    that long before its next sync.
 11. `onProgress` reports `{ sent, uploaded, toSend, received, toReceive }`.
 
 ## 3. Server
 
-12. `createSyncServer({ dataDir, currentSubject?, log?, applyConcurrency? })` from `syncbridge/node`.
+12. `createSyncServer({ dataDir, currentSubject?, log?, applyConcurrency?, maxRequests?, busyRetryAfter? })` from `syncbridge/node`.
     API: `init(subject, applyChange, { readAttachment, applyKey? })`, `handle(req, res)`,
     `appendChanges(subject, { data }, { apply? })`, `entriesBetween(subject, after, before)`,
     `failedEntries(subject)`, `pendingSubjects()`, `whenIdle()`, `close()`.
@@ -63,9 +65,14 @@ log, in the same order. Applications apply each change; the last one logged wins
     - `GET ?subject=&entry=&attachment=` → one attachment of one logged change: its upload while the
       change waits to be applied, then the host's stored copy through `readAttachment`, which returns
       `null` for a file that is not there (HTTP 404) and throws on a failure to read it (HTTP 500).
+      The server does not hash it again; the client checks it against the logged hash (item 9).
     - Any other error is a non-2xx `{ error }`. Requests are not serialized.
+    - At most `maxRequests` requests, from all clients together, are worked on at once. One more is
+      answered at once with HTTP 503, `Retry-After: busyRetryAfter` and `Connection: close`, its body
+      unread, instead of waiting in a queue until the client times out.
 15. Accepted changes are applied through `applyChange(entry, attachments)`. Each subject is scheduled
-    on its own, so one subject's backlog never holds up another's: up to `applyConcurrency` (3) of a
+    on its own, so one subject's backlog never holds up another's, and when one of its applies ends
+    only that subject's waiting changes are read again: up to `applyConcurrency` (3) of a
     subject's changes at once, the same `applyKey(entry)` one at a time in log order, different keys
     side by side, no key alone (it waits for that subject's changes before it). An apply is tried 3 times; after the third
     failure it goes on the server's failure list. Either way its uploads are deleted. `applyChange`
@@ -77,6 +84,28 @@ log, in the same order. Applications apply each change; the last one logged wins
 
 ## 4. Limits
 
-18. `SYNC_LIMITS` in `src/limits.js`: `sendBatch` 20, `receivePage` 200, `downloads` 4, `applyConcurrency` 3.
+18. `SYNC_LIMITS` in `src/limits.js`: `sendBatch` 20, `receivePage` 200, `downloads` 4, `applyConcurrency` 3,
+    `maxRequests` 128, `busyRetryAfter` 2 (seconds).
 19. Accepted limitation: a server apply that fails 3 times leaves the host's storage without that
     change while clients have it, until someone fixes the cause.
+
+## 5. Scale
+
+20. One server serves any number of clients, as many as it has the capacity for. It keeps nothing per
+    client: a client is a `clientId` on the log rows it sent. A request's work is bounded by the batch,
+    the page, or one attachment, never by how many clients or subjects there are, and past
+    `maxRequests` the server answers busy rather than slowing every client down.
+21. `npm run load -- <clients> <subjects> <changes each> <photo KB>` runs the load check: that many
+    clients, each with its own data folder, against one server in its own process, until every client
+    holds its subject's whole log. On one laptop (2026-10-19, 2 changes each with a 200 KB photo):
+
+    | clients / subjects | time | server peak memory | longest stall | failures |
+    |---|---|---|---|---|
+    | 2,000 / 1,000 | 8 s | 233 MB | 33 ms | busy answers only |
+    | 4,000 / 2,000 | 12 s | 242 MB | 95 ms | busy answers only |
+    | 8,000 / 4,000 | 28 s | 299 MB | 290 ms | busy answers only |
+
+    Before item 15's per-subject reads and item 14's limit, the same 4,000 clients took 108 s, with a
+    38 s stall, 1.5 GB, and 16,620 timeouts and resets.
+22. Clients that share one subject each download every other client's attachments, so that work
+    grows with the square of their number: it is the cost of the fan-out, not of the server.

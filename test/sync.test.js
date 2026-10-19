@@ -1,4 +1,5 @@
 import { readFile, readdir } from "node:fs/promises"
+import http from "node:http"
 import path from "node:path"
 import Database from "better-sqlite3"
 import assert from "node:assert/strict"
@@ -283,10 +284,11 @@ test("a server briefly unavailable while receiving ends the sync without giving 
   assert.deepEqual(b.applied, [{ data: "one", own: false, bytes: ["photo-a"] }])
 })
 
-test("the transport marks a 5xx answer offline and a 404 not", async () => {
-  const answer = (status) => async () => ({ ok: false, status, text: async () => "{\"error\":\"x\"}" })
+test("the transport marks a 5xx answer offline and a 404 not, and keeps a busy server's Retry-After", async () => {
+  const answer = (status, retry) => async () => ({ ok: false, status, headers: new Headers(retry ? { "retry-after": retry } : {}), text: async () => "{\"error\":\"x\"}" })
   const { createFetchTransport } = await import("../src/fetch-transport.js")
-  await assert.rejects(createFetchTransport({ url: "http://x/sync", fetch: answer(503) }).post({}), (error) => error.offline === true && error.status === 503)
+  await assert.rejects(createFetchTransport({ url: "http://x/sync", fetch: answer(503) }).post({}), (error) => error.offline === true && error.status === 503 && error.retryAfter === undefined)
+  await assert.rejects(createFetchTransport({ url: "http://x/sync", fetch: answer(503, "2") }).post({}), (error) => error.offline === true && error.retryAfter === 2)
   await assert.rejects(createFetchTransport({ url: "http://x/sync", fetch: answer(404) }).post({}), (error) => error.offline === false && error.status === 404)
 })
 
@@ -302,4 +304,41 @@ test("an attachment missing from the host is a try, and after three the change i
   const b = await startClient(root, "b", url, files)
   await b.client.sync()
   assert.match((await b.client.failedEntries())[0].error, /apply failed after 3 attempts: attachment not found/)
+})
+
+test("a stored copy that changed on the host is a try for the receiver, and after three the change is on its failure list", async (t) => {
+  const root = await tempDir(t)
+  const files = hostFiles({ "a.jpg": "photo-a" })
+  const { server, url, host } = await startServer(t, root)
+  const a = await startClient(root, "a", url, files)
+  await a.client.appendChanges(photo("one", "a.jpg"))
+  await a.client.sync()
+  await server.whenIdle()
+  host.files.set("server/one.jpg", Buffer.from("something else"))
+  const b = await startClient(root, "b", url, files)
+  await b.client.sync()
+  assert.match((await b.client.failedEntries())[0].error, /apply failed after 3 attempts: attachment one\.jpg arrived changed/)
+})
+
+test("a server at capacity answers busy at once; the sync keeps its change and it goes once there is room", async (t) => {
+  const root = await tempDir(t)
+  const files = hostFiles({ "a.jpg": "photo-a" })
+  const { server, url, applied } = await startServer(t, root, { maxRequests: 1, busyRetryAfter: 3 })
+  // Another client's upload holds the server's one place: its body has not finished arriving.
+  const target = new URL(url)
+  const held = http.request({ hostname: target.hostname, port: target.port, path: target.pathname, method: "PUT", headers: { "content-length": "10" } })
+  held.on("error", () => {})
+  held.write("12345")
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  const a = await startClient(root, "a", url, files)
+  await a.client.appendChanges(photo("one", "a.jpg"))
+  const started = Date.now()
+  await assert.rejects(a.client.sync(), (error) => error.status === 503 && error.offline === true && error.retryAfter === 3)
+  assert.ok(Date.now() - started < 1000, "a busy answer comes at once")
+  assert.deepEqual(await a.client.failedEntries(), [], "a busy answer uses none of the change's tries")
+  held.end("67890")
+  await new Promise((resolve) => held.on("response", (response) => { response.resume(); response.on("end", resolve) }))
+  assert.deepEqual(await a.client.sync(), { status: "succeed" })
+  await server.whenIdle()
+  assert.deepEqual(applied, ["one"])
 })

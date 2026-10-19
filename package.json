@@ -7,7 +7,8 @@
     "./expo": "./src/expo.js"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "load": "node testing/load.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^12.4.1"

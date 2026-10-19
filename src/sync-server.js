@@ -1,7 +1,7 @@
 import { createReadStream } from "node:fs"
 import { pipeline } from "node:stream/promises"
 import { asBytes, attachmentReader, loggedPackage, messageOf, requireFunction, requireSubject, tryThrice } from "./client-contracts.js"
-import { randomId, sha256 } from "./contracts.js"
+import { randomId } from "./contracts.js"
 import { writeHashed } from "./hash-stream.js"
 import { SYNC_LIMITS } from "./limits.js"
 import { createLog, trace } from "./log.js"
@@ -17,33 +17,37 @@ const APPLY_WINDOW = 200
 // so one user's backlog never holds up another's: up to `applyConcurrency` of a subject's changes at
 // once, the same applyKey one at a time in log order, different keys side by side, no key alone
 // (within that subject). An apply that fails three times goes on the failure list.
-export function createServer({ storage, currentSubject, log, applyConcurrency = SYNC_LIMITS.applyConcurrency }) {
+export function createServer({ storage, currentSubject, log, applyConcurrency = SYNC_LIMITS.applyConcurrency, maxRequests = SYNC_LIMITS.maxRequests, busyRetryAfter = SYNC_LIMITS.busyRetryAfter }) {
   const callbacks = new Map()
   const waiting = new Map()
+  // Each subject's applies in flight: subject → (id → { key, done }).
+  const running = new Map()
   const sink = createLog(log)
-  let drain = Promise.resolve()
   let stopped = false
+  let inFlight = 0
 
-  function wake() {
-    if (!stopped) drain = drain.then(pump, pump)
+  // Starts what one subject may apply now. It runs again when one of that subject's applies ends,
+  // so the work for each finished apply stays inside its own subject, however many subjects wait.
+  function schedule(subject) {
+    if (stopped || !callbacks.has(subject)) return
+    const mine = running.get(subject) ?? new Map()
+    running.set(subject, mine)
+    for (const row of startable(storage.unprocessedHead(subject, APPLY_WINDOW), mine)) {
+      const done = applyRow(row)
+        .catch((error) => trace(sink, { side: "server", subject, step: "error", id: row.id, error: messageOf(error) }))
+        .finally(() => { mine.delete(row.id); schedule(subject) })
+      mine.set(row.id, { key: keyOf(row), done })
+    }
+    if (mine.size === 0) running.delete(subject)
   }
 
-  async function pump() {
-    const running = new Map()
-    while (!stopped) {
-      for (const subject of storage.pendingSubjects()) {
-        if (!callbacks.has(subject)) continue
-        const mine = running.get(subject) ?? new Map()
-        for (const row of startable(storage.unprocessedHead(subject, APPLY_WINDOW), mine)) {
-          mine.set(row.id, { key: keyOf(row), done: applyRow(row).finally(() => mine.delete(row.id)) })
-        }
-        running.set(subject, mine)
-      }
-      const all = [...running.values()].flatMap((mine) => [...mine.values()])
+  // Resolves once no apply is in flight: each one that ends may have started the next.
+  async function idle() {
+    for (;;) {
+      const all = [...running.values()].flatMap((mine) => [...mine.values()].map((item) => item.done))
       if (all.length === 0) return
-      await Promise.race(all.map((item) => item.done))
+      await Promise.allSettled(all)
     }
-    await Promise.allSettled([...running.values()].flatMap((mine) => [...mine.values()].map((item) => item.done)))
   }
 
   function keyOf(row) {
@@ -136,7 +140,7 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
         break
       }
     }
-    wake()
+    schedule(subject)
     // This client's own changes come back in log order without their attachments: it has them.
     const entries = storage.page(subject, pointer, page).map((entry) => entry.clientId && entry.clientId === body.clientId
       ? { id: entry.id, position: entry.position, package: { data: entry.package.data, attachments: [] }, own: true }
@@ -159,10 +163,11 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
     }
     const readAttachment = callbacks.get(subject)?.readAttachment
     // readAttachment answers null for a file that is not there (404: a try for the receiver) and
-    // throws on a failure to read (500: the receiver stops and comes back).
+    // throws on a failure to read (500: the receiver stops and comes back). The receiver checks the
+    // bytes against the logged hash, so a stored copy that changed is a try there too.
     const found = manifest && readAttachment ? await readAttachment(manifest) : null
     const bytes = found ? asBytes(found, "attachment") : null
-    if (!bytes || sha256(bytes) !== manifest.sha256) {
+    if (!bytes) {
       sendJson(res, 404, { error: "attachment not found" })
       return
     }
@@ -176,10 +181,18 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
       requireFunction(applyChange, "applyChange")
       if (callbacks.has(subject)) throw new Error(`subject already initialized: ${subject}`)
       callbacks.set(subject, { applyChange, readAttachment: options.readAttachment, applyKey: options.applyKey })
-      wake()
+      schedule(subject)
     },
 
     async handle(req, res) {
+      // Past capacity: say so at once. The body is not read, so the connection closes after.
+      if (inFlight >= maxRequests) {
+        trace(sink, { side: "server", step: "busy", detail: { inFlight } })
+        req.resume()
+        sendJson(res, 503, { error: "the sync server is busy; try again shortly" }, { "Retry-After": String(busyRetryAfter), Connection: "close" })
+        return
+      }
+      inFlight += 1
       try {
         const query = new URL(req.url || "/", "http://localhost").searchParams
         if (req.method === "PUT") await handlePut(req, res)
@@ -190,6 +203,8 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
         trace(sink, { side: "server", step: "error", error: messageOf(error) })
         if (res.headersSent) res.destroy()
         else sendJson(res, error instanceof TypeError || error instanceof SyntaxError ? 400 : 500, { error: messageOf(error) })
+      } finally {
+        inFlight -= 1
       }
     },
 
@@ -203,7 +218,7 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
       if (!apply) return { id, position: stored.position }
       const applied = new Promise((resolve, reject) => waiting.set(`${subject}\n${id}`, { resolve, reject }))
       storage.enqueue(subject, stored.position, id, packageValue)
-      wake()
+      schedule(subject)
       await applied
       return { id, position: stored.position }
     },
@@ -212,11 +227,11 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
     failedEntries: (subject) => storage.failedEntries(subject),
     // Subjects with changes still waiting, so a restarted host can init them and let them apply.
     pendingSubjects: () => storage.pendingSubjects(),
-    whenIdle: () => drain,
+    whenIdle: () => idle(),
 
     async close() {
       stopped = true
-      await drain
+      await idle()
       storage.close()
     },
   }
@@ -230,8 +245,8 @@ async function readJson(req) {
   return body
 }
 
-function sendJson(res, status, body) {
+function sendJson(res, status, body, headers = {}) {
   const text = JSON.stringify(body)
-  res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(text) })
+  res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(text), ...headers })
   res.end(text)
 }

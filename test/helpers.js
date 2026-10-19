@@ -31,10 +31,10 @@ export function hostFiles(initial = {}) {
 }
 
 // A server on a real HTTP port whose apply records each change and stores its attachments.
-export async function startServer(t, root, { apply, applyConcurrency, applyKey } = {}) {
+export async function startServer(t, root, { apply, applyConcurrency, applyKey, maxRequests, busyRetryAfter } = {}) {
   const host = hostFiles()
   const applied = []
-  const server = createSyncServer({ dataDir: path.join(root, "server"), currentSubject: () => subject, ...(applyConcurrency ? { applyConcurrency } : {}) })
+  const server = createSyncServer({ dataDir: path.join(root, "server"), currentSubject: () => subject, applyConcurrency, maxRequests, busyRetryAfter })
   t.after(() => server.close())
   const endpoints = await listen(server, t)
   server.init(subject, apply ?? (async (entry, attachments) => {

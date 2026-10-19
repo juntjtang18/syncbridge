@@ -11,4 +11,10 @@ export const SYNC_LIMITS = {
   // Server applies in flight at once. An apply mostly waits on the host's storage (a Drive upload is
   // about a second), so a few at once multiply throughput on one thread. Drive allows ~3 writes/s.
   applyConcurrency: 3,
+  // Requests the server works on at once, from every client together. One past it is answered 503
+  // at once with Retry-After (busyRetryAfter seconds): the client's sync stops without using a try
+  // and comes back, instead of waiting in a queue until it times out. A request holds at most one
+  // attachment or one page in memory, so this also bounds the server's memory.
+  maxRequests: 128,
+  busyRetryAfter: 2,
 }

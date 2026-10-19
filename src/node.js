@@ -19,11 +19,13 @@ export function createSyncClient({ dataDir, url, headers, log, sendBatch, receiv
   })
 }
 
-export function createSyncServer({ dataDir, currentSubject, log, applyConcurrency }) {
+export function createSyncServer({ dataDir, currentSubject, log, applyConcurrency, maxRequests, busyRetryAfter }) {
   return createServer({
     storage: createNodeServerStorage(requireDataDir(dataDir)),
     currentSubject,
     log,
     ...(applyConcurrency ? { applyConcurrency } : {}),
+    ...(maxRequests ? { maxRequests } : {}),
+    ...(busyRetryAfter ? { busyRetryAfter } : {}),
   })
 }
