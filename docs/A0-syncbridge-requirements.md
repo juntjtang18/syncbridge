@@ -61,7 +61,8 @@ log, in the same order. Applications apply each change; the last one logged wins
       `entries` are at most `page` (200) entries after `pointer`, read with SQL `LIMIT`.
       A subject that is not the signed-in one (`currentSubject(req)`) is HTTP 409.
     - `GET ?subject=&entry=&attachment=` → one attachment of one logged change: its upload while the
-      change waits to be applied, then the host's stored copy through `readAttachment`.
+      change waits to be applied, then the host's stored copy through `readAttachment`, which returns
+      `null` for a file that is not there (HTTP 404) and throws on a failure to read it (HTTP 500).
     - Any other error is a non-2xx `{ error }`. Requests are not serialized.
 15. Accepted changes are applied through `applyChange(entry, attachments)`. Each subject is scheduled
     on its own, so one subject's backlog never holds up another's: up to `applyConcurrency` (3) of a

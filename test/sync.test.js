@@ -289,3 +289,17 @@ test("the transport marks a 5xx answer offline and a 404 not", async () => {
   await assert.rejects(createFetchTransport({ url: "http://x/sync", fetch: answer(503) }).post({}), (error) => error.offline === true && error.status === 503)
   await assert.rejects(createFetchTransport({ url: "http://x/sync", fetch: answer(404) }).post({}), (error) => error.offline === false && error.status === 404)
 })
+
+test("an attachment missing from the host is a try, and after three the change is on the failure list", async (t) => {
+  const root = await tempDir(t)
+  const files = hostFiles({ "a.jpg": "photo-a" })
+  const { server, url, host } = await startServer(t, root)
+  const a = await startClient(root, "a", url, files)
+  await a.client.appendChanges(photo("one", "a.jpg"))
+  await a.client.sync()
+  await server.whenIdle()
+  host.files.delete("server/one.jpg")
+  const b = await startClient(root, "b", url, files)
+  await b.client.sync()
+  assert.match((await b.client.failedEntries())[0].error, /apply failed after 3 attempts: attachment not found/)
+})

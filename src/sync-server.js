@@ -158,7 +158,10 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
       return
     }
     const readAttachment = callbacks.get(subject)?.readAttachment
-    const bytes = manifest && readAttachment ? asBytes(await readAttachment(manifest), "attachment") : null
+    // readAttachment answers null for a file that is not there (404: a try for the receiver) and
+    // throws on a failure to read (500: the receiver stops and comes back).
+    const found = manifest && readAttachment ? await readAttachment(manifest) : null
+    const bytes = found ? asBytes(found, "attachment") : null
     if (!bytes || sha256(bytes) !== manifest.sha256) {
       sendJson(res, 404, { error: "attachment not found" })
       return

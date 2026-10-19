@@ -24,7 +24,7 @@ export function hostFiles(initial = {}) {
     files,
     readAttachment(manifest) {
       const bytes = files.get(manifest.path)
-      if (!bytes) throw new Error(`missing ${manifest.path}`)
+      if (!bytes) return null
       return new Uint8Array(bytes)
     },
   }
