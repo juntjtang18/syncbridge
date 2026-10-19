@@ -1,94 +1,43 @@
-export function createFetchTransport({ url, headers, fetch }) {
-  const request = fetch ?? globalThis.fetch.bind(globalThis)
+// The client's HTTP calls, over fetch (Node 22 and Expo both have it). A non-2xx answer throws an
+// error carrying `status`; a request that never got an answer throws one marked `offline`.
+export function createFetchTransport({ url, headers, fetch: fetchImpl }) {
+  const request = fetchImpl ?? globalThis.fetch.bind(globalThis)
+
+  async function call(target, init) {
+    const extra = typeof headers === "function" ? await headers() : {}
+    const response = await request(target, { credentials: "include", ...init, headers: { ...extra, ...init.headers } })
+      .catch((error) => { throw Object.assign(error instanceof Error ? error : new Error(String(error)), { offline: true }) })
+    if (response.ok) return response
+    const text = await response.text().catch(() => "")
+    let message = text || `HTTP ${response.status}`
+    try { message = JSON.parse(text).error || message } catch { /* not JSON */ }
+    throw Object.assign(new Error(message), { status: response.status })
+  }
 
   return {
-    async put(body) {
-      const extra = { "content-type": "application/octet-stream" }
-      if (body instanceof Uint8Array) extra["content-length"] = String(body.byteLength)
-      const response = await request(url, {
+    // Uploads bytes; the server answers { upload, sha256, size } for this one upload.
+    async put(bytes) {
+      const response = await call(url, {
         method: "PUT",
-        credentials: "include",
-        headers: await requestHeaders(headers, extra),
-        duplex: "half",
-        body,
+        headers: { "content-type": "application/octet-stream", "content-length": String(bytes.byteLength) },
+        body: bytes,
       })
-      const text = await requireText(response)
-      const parsed = text ? JSON.parse(text) : {}
-      return { upload: parsed.upload, sha256: parsed.sha256, size: parsed.size }
+      return response.json()
     },
 
     async post(body) {
-      const payload = JSON.stringify(body)
-      const response = await request(url, {
-        method: "POST",
-        credentials: "include",
-        headers: await requestHeaders(headers, {
-          "content-type": "application/json",
-          "content-length": String(new TextEncoder().encode(payload).byteLength),
-        }),
-        body: payload,
-      })
-      const text = await response.text()
-      let parsed = {}
-      if (text) {
-        try {
-          parsed = JSON.parse(text)
-        } catch {
-          parsed = {}
-        }
-      }
-      if (response.status === 409 && parsed && typeof parsed.subject === "string") return parsed
-      if (!response.ok) throw errorFromText(text, parsed, response.status)
-      return parsed
+      const response = await call(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })
+      return response.json()
     },
 
-    // One attachment of one logged change: GET /sync?subject=&entry=&attachment=.
+    // One attachment of one logged change.
     async get(subject, entry, attachment) {
-      const response = await request(attachmentUrl(url, subject, entry, attachment), {
-        method: "GET",
-        credentials: "include",
-        headers: await requestHeaders(headers),
-      })
-      if (!response.ok) throw await errorFrom(response)
+      const target = new URL(url)
+      target.searchParams.set("subject", subject)
+      target.searchParams.set("entry", entry)
+      target.searchParams.set("attachment", attachment)
+      const response = await call(target.toString(), { method: "GET", headers: {} })
       return new Uint8Array(await response.arrayBuffer())
     },
   }
-}
-
-function attachmentUrl(url, subject, entry, attachment) {
-  const target = new URL(url)
-  target.searchParams.set("subject", subject)
-  target.searchParams.set("entry", entry)
-  target.searchParams.set("attachment", attachment)
-  return target.toString()
-}
-
-async function requestHeaders(headers, extra = {}) {
-  const provided = typeof headers === "function" ? await headers() : {}
-  if (provided === null || typeof provided !== "object" || Array.isArray(provided)) {
-    throw new TypeError("headers must return an object")
-  }
-  return { ...provided, ...extra }
-}
-
-async function requireText(response) {
-  if (response.ok) return response.status === 204 ? "" : response.text()
-  throw await errorFrom(response)
-}
-
-async function errorFrom(response) {
-  const text = await response.text()
-  let parsed
-  try {
-    parsed = JSON.parse(text)
-  } catch {
-    parsed = null
-  }
-  return errorFromText(text, parsed, response.status)
-}
-
-function errorFromText(text, parsed, status) {
-  let message
-  if (parsed && typeof parsed.error === "string") message = parsed.error
-  return new Error(message || text || `request failed with status ${status}`)
 }

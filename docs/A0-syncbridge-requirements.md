@@ -1,59 +1,78 @@
 # SyncBridge — Requirements
 
-**Status:** 2026-10-19 (batched send, per-upload staging, paged receive, progress, server failures, apply by key)  
-**Design:** [A1](./A1-syncbridge-highlevel-design.md)  
-**Changing subject:** [A1-1](./A1-1-syncbridge-changing-subject.md)  
-**Attachment pointer:** [A1-2](./A1-2-attachment-internal-uri.md)  
+**Status:** 2026-10-19, the minimal design. It replaces the earlier multi-subject client, retry
+counters on the wire, five ack statuses and shared attachment staging.
 **Client send:** [B1](./B1-syncbridge-client-send.md)
 
-SyncBridge is client-server middleware for synchronizing opaque application changes.
+SyncBridge keeps one ordered change log per subject on a server and gives every client the same
+log, in the same order. Applications apply each change; the last one logged wins.
 
-## 1. Nodes and subjects
+## 1. Log and subjects
 
-1. A sync system has one server and one or more clients. Two phones and a server are the first case.
-2. Any node can make a change.
-3. A `subject` is one opaque string that names one independent ordered log. Nodes using the same subject see the same log.
-4. SyncBridge does not parse subject semantics. An application may use `"default"`, `"tenant.company-123"`, `"tenant.company-123.seat.mail%40example%2Ecom"`, or `"user.{id}.{driver}.{root}"` when the configured root can change.
-5. The server stores no pointer for any client. Each client persists a pointer (and outbox) for each subject it has seen. A subject this client has never seen starts at pointer `0`. Returning to a known subject reuses that pointer. Changing current does not reset another subject's pointer.
-6. The transport host authenticates callers, authorizes their use of subjects, and names the **live** subject. SyncBridge treats a subject only as a log name. One subject is one `changelog0`.
+1. One server and any number of clients. A `subject` is an opaque string naming one log (e.g. `user.4`).
+2. A log entry is `{ id, position, package }`. The server assigns `position`. `id` makes a resend a no-op.
+3. A package is `{ data, attachments }`. `data` is any JSON. An attachment is `{ id, path, contentType? }`
+   when queued, and `{ id, path, contentType?, upload, sha256, size }` once logged. `path` is the
+   host's pointer; SyncBridge never parses it.
+4. The hash of an attachment only checks that bytes arrived as sent: client to server on upload,
+   server to client on download. It never links one entry to another. There is no dedupe.
 
-## 2. Package and attachments
+## 2. Client
 
-7. A log entry is `{ id, position, package }`. `id` prevents a retry from being appended twice; SyncServer assigns `position`.
-8. A package is `{ data: JSONValue, attachments: [] }`. `data` can be a string or any JSON value.
-9. An attachment persisted in a log package is a manifest `{ id, sha256, size, upload, contentType, path }`. At `appendChanges`, the application supplies `{ id, path, contentType }`. `path` is a host-internal pointer. SyncBridge does not parse it. `upload`, `sha256` and `size` are filled by the PUT: `upload` names that one upload, and `sha256` checks the bytes arrived intact. Every upload is its own: two changes never share one, even with the same bytes.
-10. SyncBridge does not inspect, run, or evaluate `data`. SQL and scripts are only data unless an application callback chooses to execute them.
+5. `createSyncClient({ dataDir, url, headers?, log? })` from `syncbridge/node` or `syncbridge/expo`.
+   API: `init(subject, applyChange, { readAttachment })`, `appendChanges(package)`, `sync()`,
+   `failedEntries()`, `onProgress(listener)`.
+6. Files, per subject under `dataDir/<subject>/`: `outbox/<seq>-<id>.json` (one queued change each),
+   `pointer` (last position applied here), `failures.json`; and `dataDir/client-id`.
+7. `appendChanges` writes one outbox file and returns `{ id }`, offline, even while a sync runs.
+8. `sync()` runs only when called, one at a time. It repeats until the outbox is empty and no page
+   is left:
+   - take the oldest `sendBatch` (20) outbox changes;
+   - upload each attachment not yet uploaded: hash the bytes, `PUT` them, check the answer's
+     `sha256` and `size`, and keep `upload`, `sha256`, `size` on the change's outbox file at once
+     (a stop re-uploads nothing already up);
+   - `POST` the batch with the pointer; delete the accepted changes from the outbox;
+   - apply each returned entry in order, then set the pointer to its position.
+9. Applying an entry: download each attachment (`GET`), check its hash and size, call
+   `applyChange(entry, attachments)`. `entry.own` is true for this client's own changes, which come
+   back in log order without attachments.
+10. One rule for failures: an item is tried up to 3 times back to back. A change the server refuses
+    is resent (its attachments uploaded afresh) up to 3 times; an entry that does not download intact
+    or apply is retried 3 times. After the third failure it goes on `failures.json` and the sync moves
+    on (for an entry, the pointer still moves past it). A network failure is not a try: `sync()`
+    throws and the next sync resumes where it stopped.
+11. `onProgress` reports `{ sent, uploaded, toSend, received, toReceive }`.
 
-## 3. Client
+## 3. Server
 
-11. The platform creates a client with a persistent `dataDir` and a transport `send` function. One client holds many subjects and one current subject.
-12. The client API is `use(subject, applyChange, { readAttachment })`, `current()`, `subjects()`, `sync()`, `appendChanges(package)`, `failedEntries()`, `whenIdle()`, and `onProgress(listener)`. `use` creates the subject if new, reuses its pointer if known, and sets current. `sync` and `appendChanges` apply to current only. `readAttachment(manifest)` is the host callback that streams bytes for an outbox `path` when sending.
-13. SyncBridge owns, per subject, the client's pointer, outbox, unprocessed queue, and failure list inside its `dataDir`. It also persists which subject is current and a stable `clientId`. Attachment temps live in `dataDir` only until a successful local apply deletes them.
-14. `appendChanges` queues a local change on the current subject without requiring a network connection. It returns when the change is stored in that subject's `incoming/` directory, including while `sync()` is still running. Unsent work stays in `incoming/` or `inflight/` if current moves away. The handoff is [B1](./B1-syncbridge-client-send.md).
-15. `sync()` happens only when the application calls it; SyncBridge does not poll.
-15b. `sync()` asks for entries in pages of at most `receivePage` (`SYNC_LIMITS.receivePage`, 200). An ack then carries `more` (others follow), `remaining` (entries this client has yet to receive, this page included) and `applying` (changes the server has yet to apply). `sync()` keeps posting until `more` is false. A skip past the page's end waits for the page that reaches it. A client that sends no `receivePage` gets every entry in one ack, as before.
-15c. `onProgress(listener)` calls `listener({ sent, uploaded, toSend, received, toReceive, applying })` as a `sync()` moves: changes acked, and changes whose bytes are up (photo by photo), of those queued when it began, entries saved of those the server has for this client, and the server's apply backlog. It returns a function that stops the calls.
-15a. `sync()` sends the outbox in batches of at most `sendBatch` changes (`SYNC_LIMITS.sendBatch`, 20; a host may pass its own to `createClient`). Each batch uploads its attachments, posts, and is acked before the next, so the server applies early batches while later ones upload, new data reaches the server within about a minute even with camera photos on a slow network, and a stop loses at most the batch in flight. Each change's `sha256` and `size` are written onto its outbox file as soon as its attachments are up, so a later `sync()` does not upload them again.
-16. `sync()` blocks until the `POST /sync` ack and until each downloaded entry and its attachment bytes are saved locally. It does not wait for server `applyChange` or for the client's own `applyChange`. The pointer means received through here. It moves when the entry is saved, including an entry the sender gave up after 3 failure acks, and it moves across entries this same client appended without saving those. Apply does not move it again.
-16a. Every `POST /sync` response includes the host's live `subject` and a `status`. The client compares `subject` to the one it sent. If they differ, the client `use`s the live subject and returns `{ status: "switched", switched: true, subject }`. `PUT /sync` streams bytes into a new upload and returns `{ upload, sha256, size }`. A known write or hash problem returns `{ status: "failed", error }`. An unexpected PUT throw returns `{ status: "error", error }`. `GET /sync?subject=&entry=&attachment=` returns one attachment of one logged change: its upload while the change waits to be applied, then the host's stored copy through `readAttachment`. A missing one is HTTP 404. The changelog stores `path`, not a URL.
-16b. If the request subject is not the live subject, the host does not append to that log. It answers HTTP 409 with `{ status: "switched", subject }` and still returns the live subject.
-16c. Predicted POST statuses, all HTTP 200 except `switched`: `succeed` (every change in the batch was saved), `partial` (`acceptedIds` were saved and the server stopped at the first change it could not store), `failed` (nothing new was saved), `switched` (request subject is not live). An unexpected throw is `{ status: "error", error }` with HTTP 200. The process stays up. A `failed` or `partial` receive stores nothing for the refused change and writes no failure-list row.
+12. `createSyncServer({ dataDir, currentSubject?, log?, applyConcurrency? })` from `syncbridge/node`.
+    API: `init(subject, applyChange, { readAttachment, applyKey? })`, `handle(req, res)`,
+    `appendChanges(subject, { data }, { apply? })`, `entriesBetween(subject, after, before)`,
+    `failedEntries(subject)`, `pendingSubjects()`, `whenIdle()`, `close()`.
+13. State under `dataDir`: `syncbridge.sqlite` (the logs, the changes waiting to be applied, given-up
+    applies) and `uploads/<upload>` (one file per `PUT`, until its change is applied).
+14. HTTP on one path:
+    - `PUT` bytes → `{ upload, sha256, size }`. Every upload is its own file.
+    - `POST { subject, pointer, clientId, changes, page }` → `{ acceptedIds, refused?, entries, more, remaining }`.
+      Changes are accepted in order; the first that cannot be (its upload missing or not the logged
+      size, or malformed) is named in `refused: { id, error }` and the rest wait for the next post.
+      `entries` are at most `page` (200) entries after `pointer`, read with SQL `LIMIT`.
+      A subject that is not the signed-in one (`currentSubject(req)`) is HTTP 409.
+    - `GET ?subject=&entry=&attachment=` → one attachment of one logged change: its upload while the
+      change waits to be applied, then the host's stored copy through `readAttachment`.
+    - Any other error is a non-2xx `{ error }`. Requests are not serialized.
+15. Accepted changes are applied through `applyChange(entry, attachments)`, up to `applyConcurrency`
+    (3) at once: the same `applyKey(entry)` one at a time in log order, different keys side by side,
+    no key alone (it waits for everything before it). An apply is tried 3 times; after the third
+    failure it goes on the server's failure list. Either way its uploads are deleted. `applyChange`
+    may return `{ attachments: [{ id, path }] }` to point later downloads at the stored copy.
+16. `appendChanges(subject, { data })` logs a host change for every client. With `{ apply: true }`
+    it is also applied, in log order with the clients' changes, and resolves once applied.
+17. A subject not initialized yet keeps its changes waiting; `pendingSubjects()` names them so a
+    restarted host can `init` them.
 
-## 4. applyChange
+## 4. Limits
 
-17. SyncBridge calls `await applyChange(entry, attachments)` for one received entry. On the server, during the upload that just arrived, `attachments.get(id).read()` reads the in-flight PUT temp. On the client, `attachments.get(id).read()` for a received entry calls `GET /sync?sha256=`. The client's `readAttachment` is only for sending.
-18. `attachments.get(id).read()` returns verified bytes for an attachment named in that entry.
-19. The callback writes business data and copies or moves attachment bytes to the application's final destination. It throws on failure.
-20. Apply runs on the node that saved the log, after the ack, on that node's unprocessed queue. On the server, `init(subject, applyChange, { readAttachment, applyKey })` may name what each change touches: `applyKey(entry)` returns a string or nothing. Up to `applyConcurrency` (`SYNC_LIMITS.applyConcurrency`, 3) applies run at once; changes with the same key apply one at a time in log order, different keys may overlap, and a change without a key waits for every change before it and runs alone. SyncBridge only compares keys. A host without `applyKey` applies one change at a time, as before. The first two throws leave the entry at the head. The third moves it to that node's failure list with `apply failed after 3 attempts: …`, keeps the attachment temps, and the worker continues. The pointer is not rewound.
-
-## 5. Server
-
-21. The server creates SyncServer with a persistent `dataDir`; SyncServer owns the ordered log, duplicate IDs, and a short-lived PUT temp. `init(subject, applyChange, { readAttachment })` registers the host reader for that subject.
-22. SyncServer persists `changelog0` in its SQLite file under `dataDir`, indexed by subject and position. A successful receive appends there and enqueues the server unprocessed queue. A change's uploads are deleted after its `applyChange` succeeds; no other change uses them. `applyChange` may return `{ attachments: [{ id, path }] }` to update `path` on that log row. A later `GET /sync?sha256=` calls `readAttachment` with that manifest. `failedEntries(subject)` and `whenIdle()` expose the failure list and the drained unprocessed queue. `pendingSubjects()` names the subjects whose changes are still waiting, so a host that restarted can `init` them and let their applies resume without waiting for a request. Each ack to a client also lists, as `serverFailed`, the changes that client sent which the server could not apply; the client adds each once to its own failure list with `side: "server"`, so its `failedEntries()` shows them.
-23. A client sends `{ subject, pointer, changes, clientId }`. When that subject is live, SyncServer appends each new client change once, records that `clientId` on the log row, acks, and returns entries after `pointer` plus the live `subject`. A row this `clientId` appended is one of those entries, in log order, marked `own: true` and with no attachments: the client downloads nothing for it and applies it like any other, so every copy replays the same log. Other clients receive the row with its attachments. A row with no `clientId` — a server `appendChanges`, or a row written before this column existed — is delivered to every client. SyncServer does not call `applyChange` on the request. The server does not store the client's pointer. It stores per-client send attempts for `(subject, clientId, id)`.
-24. A BizServer local change is appended to `changelog0` and is not enqueued for apply: BizServer already wrote its own business storage. `appendChanges` returns while a client apply may still be running.
-25. Upload and download use the same sender and receiver roles. The receiver tries to save the log entry and the attachment temps. If that fails it stores nothing, acks `failed`, and does not count. If it succeeds it acks `succeed`. The sender counts a `failed`, `partial`, or `error` ack. Attempts 1 and 2 keep the entry and send nothing after it. Attempt 3 moves it to the sender's failure list with `send failed after 3 attempts: …` and the same `sync()` sends the next entry. On a download, the client posts `receiveFailed` for the id it could not save. At 3, the server skips that entry for that `clientId` only. Other clients still receive it.
-
-## 6. Reuse
-
-26. SyncBridge is its own project. Site Inspect and later applications can use it through Node and Expo platform entries without placing business schemas, business storage, or subject semantics in the library.
+18. `SYNC_LIMITS` in `src/limits.js`: `sendBatch` 20, `receivePage` 200, `applyConcurrency` 3.
+19. Accepted limitation: a server apply that fails 3 times leaves the host's storage without that
+    change while clients have it, until someone fixes the cause.

@@ -1,5 +1,8 @@
 # A1-1 — Changing subject (server folder)
 
+> **Superseded (2026-10-19).** [A0](./A0-syncbridge-requirements.md) now describes SyncBridge in full: one subject per client data folder, per-upload staging, one 3-try failure rule. This document is kept for history.
+
+
 **Status:** 2026-10-06  
 **Amends:** [A1](./A1-syncbridge-highlevel-design.md) · **Requirements:** [A0](./A0-syncbridge-requirements.md)
 

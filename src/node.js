@@ -1,26 +1,29 @@
-import { randomId, requireDataDir, requireUrl, sha256 } from "./contracts.js"
-import { createHttpTransport } from "./http-transport.js"
-import { createNodeClientStorage } from "./node-client-storage.js"
+import { requireDataDir, requireUrl } from "./client-contracts.js"
+import { createClientStorage } from "./client-storage.js"
+import { randomId, sha256 } from "./contracts.js"
+import { createFetchTransport } from "./fetch-transport.js"
+import { nodeFs } from "./node-fs.js"
 import { createNodeServerStorage } from "./node-server-storage.js"
 import { createClient } from "./sync-client.js"
 import { createServer } from "./sync-server.js"
 
-export function createSyncClient({ dataDir, url, headers, log }) {
-  requireDataDir(dataDir)
-  requireUrl(url)
-  if (headers !== undefined && typeof headers !== "function") {
-    throw new TypeError("headers must be a function")
-  }
+export function createSyncClient({ dataDir, url, headers, log, sendBatch, receivePage }) {
   return createClient({
-    storage: createNodeClientStorage(dataDir),
-    transport: createHttpTransport({ url, headers }),
+    storage: createClientStorage(nodeFs, requireDataDir(dataDir), randomId),
+    transport: createFetchTransport({ url: requireUrl(url), headers }),
     sha256,
     randomId,
     log,
+    ...(sendBatch ? { sendBatch } : {}),
+    ...(receivePage ? { receivePage } : {}),
   })
 }
 
 export function createSyncServer({ dataDir, currentSubject, log, applyConcurrency }) {
-  requireDataDir(dataDir)
-  return createServer({ storage: createNodeServerStorage(dataDir), currentSubject, log, ...(applyConcurrency ? { applyConcurrency } : {}) })
+  return createServer({
+    storage: createNodeServerStorage(requireDataDir(dataDir)),
+    currentSubject,
+    log,
+    ...(applyConcurrency ? { applyConcurrency } : {}),
+  })
 }

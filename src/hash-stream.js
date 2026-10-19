@@ -1,14 +1,9 @@
 import { createHash } from "node:crypto"
-import { createReadStream, createWriteStream } from "node:fs"
+import { createWriteStream } from "node:fs"
 import { Transform } from "node:stream"
 import { pipeline } from "node:stream/promises"
 
-export async function hashFile(file) {
-  const hash = createHash("sha256")
-  await pipeline(createReadStream(file), hash)
-  return hash.digest("hex")
-}
-
+// Streams an upload to `file`, hashing it on the way.
 export async function writeHashed(source, file) {
   const hash = createHash("sha256")
   let size = 0

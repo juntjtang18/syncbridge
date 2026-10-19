@@ -3,7 +3,6 @@
   "version": "0.1.0",
   "type": "module",
   "exports": {
-    ".": "./src/index.js",
     "./node": "./src/node.js",
     "./expo": "./src/expo.js"
   },
@@ -19,9 +18,15 @@
     "expo-file-system": "*"
   },
   "peerDependenciesMeta": {
-    "expo": { "optional": true },
-    "expo-crypto": { "optional": true },
-    "expo-file-system": { "optional": true }
+    "expo": {
+      "optional": true
+    },
+    "expo-crypto": {
+      "optional": true
+    },
+    "expo-file-system": {
+      "optional": true
+    }
   },
   "engines": {
     "node": ">=22"

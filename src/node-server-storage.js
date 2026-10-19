@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto"
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs"
 import path from "node:path"
 import Database from "better-sqlite3"
 
+// The server's state under `dataDir`:
+//   syncbridge.sqlite  each subject's log, the changes waiting to be applied, and given-up applies
+//   uploads/<upload>   one file per PUT, until its change is applied
 export function createNodeServerStorage(dataDir) {
   mkdirSync(dataDir, { recursive: true })
   const db = new Database(path.join(dataDir, "syncbridge.sqlite"))
@@ -40,361 +43,83 @@ export function createNodeServerStorage(dataDir) {
       failed_at TEXT NOT NULL,
       PRIMARY KEY (subject, id, client_id, kind)
     );
-    CREATE TABLE IF NOT EXISTS send_attempts (
-      subject TEXT NOT NULL,
-      client_id TEXT NOT NULL,
-      id TEXT NOT NULL,
-      attempts INTEGER NOT NULL,
-      PRIMARY KEY (subject, client_id, id)
-    );
   `)
-  const logColumns = db.prepare("PRAGMA table_info(log_entries)").all()
-  if (!logColumns.some((column) => column.name === "client_id")) {
-    db.exec("ALTER TABLE log_entries ADD COLUMN client_id TEXT")
-  }
-  if (!logColumns.some((column) => column.name === "base_position")) {
-    db.exec("ALTER TABLE log_entries ADD COLUMN base_position INTEGER")
-  }
+  const uploads = path.join(dataDir, "uploads")
+  mkdirSync(uploads, { recursive: true })
 
-  const selectById = db.prepare("SELECT position FROM log_entries WHERE subject = ? AND id = ?")
-  const countUnprocessed = db.prepare("SELECT count(*) AS n FROM unprocessed WHERE subject = ?")
-  const selectApplyFailuresFor = db.prepare(`
-    SELECT f.id, f.position, f.error, f.failed_at FROM failed_entries f
-    JOIN log_entries l ON l.subject = f.subject AND l.id = f.id
-    WHERE f.subject = ? AND f.kind = 'apply' AND l.client_id = ?
-    ORDER BY f.position
-  `)
-  const selectEntry = db.prepare("SELECT package_json FROM log_entries WHERE subject = ? AND id = ?")
-  const selectCounter = db.prepare("SELECT next_position FROM subject_counters WHERE subject = ?")
-  const insertCounter = db.prepare("INSERT INTO subject_counters (subject, next_position) VALUES (?, ?)")
-  const updateCounter = db.prepare("UPDATE subject_counters SET next_position = ? WHERE subject = ?")
-  const insertEntry = db.prepare(
-    "INSERT INTO log_entries (subject, position, id, package_json, client_id, base_position) VALUES (?, ?, ?, ?, ?, ?)",
-  )
-  const updatePackage = db.prepare("UPDATE log_entries SET package_json = ? WHERE subject = ? AND id = ?")
-  const selectAfter = db.prepare(`
-    SELECT id, position, package_json, client_id, base_position
-    FROM log_entries
-    WHERE subject = ? AND position > ?
-    ORDER BY position ASC
-  `)
-  const selectBetween = db.prepare(`
-    SELECT id, position, package_json, client_id, base_position
-    FROM log_entries
-    WHERE subject = ? AND position > ? AND position < ?
-    ORDER BY position ASC
-  `)
-  const selectOrigin = db.prepare("SELECT client_id, base_position FROM log_entries WHERE subject = ? AND id = ?")
-  const selectTip = db.prepare("SELECT MAX(position) AS position FROM log_entries WHERE subject = ?")
-  const deleteEntry = db.prepare("DELETE FROM log_entries WHERE subject = ? AND id = ? AND position = ?")
-  const selectEntryById = db.prepare(`
-    SELECT id, position, package_json
-    FROM log_entries
-    WHERE subject = ? AND id = ?
-  `)
-  const insertUnprocessed = db.prepare(`
-    INSERT OR IGNORE INTO unprocessed (subject, position, id, package_json, attempts)
-    VALUES (?, ?, ?, ?, 0)
-  `)
-  const selectUnprocessedBySubject = db.prepare(`
-    SELECT position, id, package_json, attempts
-    FROM unprocessed
-    WHERE subject = ?
-    ORDER BY seq ASC
-  `)
-  const deleteUnprocessedSubject = db.prepare("DELETE FROM unprocessed WHERE subject = ?")
-  const insertUnprocessedRow = db.prepare(`
-    INSERT INTO unprocessed (subject, position, id, package_json, attempts)
-    VALUES (?, ?, ?, ?, ?)
-  `)
-  const selectHead = db.prepare(`
-    SELECT subject, position, id, package_json, attempts
-    FROM unprocessed
-    ORDER BY seq ASC
-    LIMIT 1
-  `)
-  const selectUnprocessedCount = db.prepare("SELECT COUNT(*) AS count FROM unprocessed")
-  const selectPendingSubjects = db.prepare("SELECT DISTINCT subject FROM unprocessed ORDER BY subject")
-  const selectHeadRows = db.prepare(`
-    SELECT subject, position, id, package_json, attempts
-    FROM unprocessed
-    ORDER BY seq ASC
-    LIMIT ?
-  `)
-  const updateAttempts = db.prepare("UPDATE unprocessed SET attempts = ? WHERE subject = ? AND id = ?")
-  const deleteUnprocessed = db.prepare("DELETE FROM unprocessed WHERE subject = ? AND id = ?")
-  const insertFailure = db.prepare(`
-    INSERT OR REPLACE INTO failed_entries (subject, position, id, client_id, kind, error, failed_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `)
-  const selectFailures = db.prepare(`
-    SELECT position, id, client_id, kind, error, failed_at
-    FROM failed_entries
-    WHERE subject = ?
-    ORDER BY failed_at ASC, id ASC
-  `)
-  const selectSendFailure = db.prepare(`
-    SELECT position, id
-    FROM failed_entries
-    WHERE subject = ? AND id = ? AND client_id = ? AND kind = 'send'
-  `)
-  const selectSendAttempt = db.prepare(`
-    SELECT attempts FROM send_attempts WHERE subject = ? AND client_id = ? AND id = ?
-  `)
-  const insertSendAttempt = db.prepare(`
-    INSERT INTO send_attempts (subject, client_id, id, attempts) VALUES (?, ?, ?, ?)
-  `)
-  const updateSendAttempt = db.prepare(`
-    UPDATE send_attempts SET attempts = ? WHERE subject = ? AND client_id = ? AND id = ?
-  `)
+  const q = {
+    entry: db.prepare("SELECT id, position, package_json, client_id FROM log_entries WHERE subject = ? AND id = ?"),
+    counter: db.prepare("SELECT next_position FROM subject_counters WHERE subject = ?"),
+    setCounter: db.prepare("INSERT INTO subject_counters (subject, next_position) VALUES (?, ?) ON CONFLICT (subject) DO UPDATE SET next_position = excluded.next_position"),
+    insert: db.prepare("INSERT INTO log_entries (subject, position, id, package_json, client_id) VALUES (?, ?, ?, ?, ?)"),
+    page: db.prepare("SELECT id, position, package_json, client_id FROM log_entries WHERE subject = ? AND position > ? ORDER BY position LIMIT ?"),
+    after: db.prepare("SELECT count(*) AS n FROM log_entries WHERE subject = ? AND position > ?"),
+    between: db.prepare("SELECT id, position, package_json, client_id FROM log_entries WHERE subject = ? AND position > ? AND position < ? ORDER BY position"),
+    setPackage: db.prepare("UPDATE log_entries SET package_json = ? WHERE subject = ? AND id = ?"),
+    enqueue: db.prepare("INSERT OR IGNORE INTO unprocessed (subject, position, id, package_json) VALUES (?, ?, ?, ?)"),
+    head: db.prepare("SELECT subject, position, id, package_json FROM unprocessed ORDER BY seq LIMIT ?"),
+    dequeue: db.prepare("DELETE FROM unprocessed WHERE subject = ? AND id = ?"),
+    waiting: db.prepare("SELECT count(*) AS n FROM unprocessed"),
+    pending: db.prepare("SELECT DISTINCT subject FROM unprocessed ORDER BY subject"),
+    fail: db.prepare("INSERT OR REPLACE INTO failed_entries (subject, position, id, client_id, kind, error, failed_at) VALUES (?, ?, ?, '', 'apply', ?, ?)"),
+    failures: db.prepare("SELECT id, position, error, failed_at FROM failed_entries WHERE subject = ? ORDER BY position"),
+  }
+  const row = (found) => found && { id: found.id, position: found.position, package: JSON.parse(found.package_json), clientId: found.client_id || null }
 
-  const append = db.transaction((subject, id, packageValue, clientId, base) => {
-    const existing = selectById.get(subject, id)
+  const append = db.transaction((subject, id, packageValue, clientId) => {
+    const existing = q.entry.get(subject, id)
     if (existing) return { duplicate: true, position: existing.position }
-    const counter = selectCounter.get(subject)
-    const position = counter ? counter.next_position : 1
-    if (counter) updateCounter.run(position + 1, subject)
-    else insertCounter.run(subject, position + 1)
-    insertEntry.run(subject, position, id, JSON.stringify(packageValue), clientId || null, Number.isInteger(base) ? base : null)
+    const position = q.counter.get(subject)?.next_position ?? 1
+    q.setCounter.run(subject, position + 1)
+    q.insert.run(subject, position, id, JSON.stringify(packageValue), clientId || null)
     return { duplicate: false, position }
   })
 
-  const removeTip = db.transaction((subject, id, position) => {
-    const tip = selectTip.get(subject)
-    if (!tip || tip.position !== position) throw new Error("cannot roll back a log entry that is not the tip")
-    deleteEntry.run(subject, id, position)
-    updateCounter.run(position, subject)
-  })
-
-  // One file per upload, named by its upload id: no two changes share one, so each is deleted
-  // once its own change is applied.
-  function blobFile(upload) {
-    return path.join(dataDir, "blobs", requireUpload(upload))
+  function uploadFile(upload) {
+    if (typeof upload !== "string" || !/^[0-9a-f-]{16,64}$/.test(upload)) throw new TypeError("upload is invalid")
+    return path.join(uploads, upload)
   }
 
   return {
-    // `base` is the sender's pointer when it sent the change: the last position it had seen.
-    appendEntry(subject, id, packageValue, clientId, base) {
-      return append(subject, id, packageValue, clientId, base)
+    appendEntry: (subject, id, packageValue, clientId = null) => append(subject, id, packageValue, clientId),
+    entryById: (subject, id) => row(q.entry.get(subject, id)),
+    page: (subject, after, limit) => q.page.all(subject, after, limit).map(row),
+    countAfter: (subject, after) => q.after.get(subject, after).n,
+    entriesBetween: (subject, after, before) => q.between.all(subject, after, before).map(row),
+
+    // The host's apply may move an attachment; later downloads read it from its new path.
+    setAttachmentPaths(subject, id, moved) {
+      const entry = row(q.entry.get(subject, id))
+      const byId = new Map(moved.map((item) => [item.id, item.path]))
+      const attachments = entry.package.attachments.map((manifest) => ({ ...manifest, path: byId.get(manifest.id) || manifest.path }))
+      q.setPackage.run(JSON.stringify({ ...entry.package, attachments }), subject, id)
     },
 
-    entryOrigin(subject, id) {
-      const row = selectOrigin.get(subject, id)
-      if (!row) return { clientId: null, base: null }
-      return { clientId: row.client_id || null, base: Number.isInteger(row.base_position) ? row.base_position : null }
-    },
+    enqueue: (subject, position, id, packageValue) => q.enqueue.run(subject, position, id, JSON.stringify(packageValue)),
+    unprocessedHead: (limit) => q.head.all(limit).map((found) => ({ ...row(found), subject: found.subject })),
+    dequeue: (subject, id) => q.dequeue.run(subject, id),
+    hasUnprocessed: () => q.waiting.get().n > 0,
+    pendingSubjects: () => q.pending.all().map((found) => found.subject),
 
-    entriesBetween(subject, after, before) {
-      return selectBetween.all(subject, after, before).map(logRow)
-    },
+    recordFailure: (subject, position, id, error) => q.fail.run(subject, position, id, error, new Date().toISOString()),
+    failedEntries: (subject) => q.failures.all(subject).map((found) => ({ id: found.id, position: found.position, error: found.error, failedAt: found.failed_at })),
 
-    hasEntry(subject, id) {
-      return Boolean(selectById.get(subject, id))
-    },
-
-    entriesAfter(subject, pointer) {
-      return selectAfter.all(subject, pointer).map(logRow)
-    },
-
-
-    updateAttachmentPaths(subject, id, updates) {
-      if (!Array.isArray(updates) || updates.length === 0) return
-      const row = selectEntry.get(subject, id)
-      if (!row) return
-      const packageValue = JSON.parse(row.package_json)
-      const byId = new Map(updates.map((item) => [item.id, item]))
-      for (const manifest of packageValue.attachments) {
-        const next = byId.get(manifest.id)
-        if (next && typeof next.path === "string" && next.path.length > 0) {
-          manifest.path = next.path
-        }
-      }
-      updatePackage.run(JSON.stringify(packageValue), subject, id)
-    },
-
-    removeTip(subject, id, position) {
-      removeTip(subject, id, position)
-    },
-
-    entryById(subject, id) {
-      const row = selectEntryById.get(subject, id)
-      if (!row) return null
-      return { id: row.id, position: row.position, package: JSON.parse(row.package_json) }
-    },
-
-    enqueueUnprocessed(subject, position, id, packageValue) {
-      insertUnprocessed.run(subject, position, id, JSON.stringify(packageValue))
-    },
-
-    listUnprocessed(subject) {
-      return selectUnprocessedBySubject.all(subject).map((row) => ({
-        id: row.id,
-        position: row.position,
-        package: JSON.parse(row.package_json),
-        attempts: row.attempts,
-      }))
-    },
-
-    replaceUnprocessed(subject, rows) {
-      const replace = db.transaction((items) => {
-        deleteUnprocessedSubject.run(subject)
-        for (const row of items) {
-          insertUnprocessedRow.run(subject, row.position, row.id, JSON.stringify(row.package), row.attempts)
-        }
-      })
-      replace(rows)
-    },
-
-    headUnprocessed() {
-      const row = selectHead.get()
-      if (!row) return null
-      return {
-        subject: row.subject,
-        position: row.position,
-        id: row.id,
-        package: JSON.parse(row.package_json),
-        attempts: row.attempts,
-      }
-    },
-
-    // Changes this client sent that the server could not apply, for the client's failure list.
-    applyFailuresFor(subject, clientId) {
-      return selectApplyFailuresFor.all(subject, clientId).map((row) => ({ id: row.id, position: row.position, error: row.error, failedAt: row.failed_at }))
-    },
-
-    unprocessedCount(subject) {
-      return countUnprocessed.get(subject).n
-    },
-
-    pendingSubjects() {
-      return selectPendingSubjects.all().map((row) => row.subject)
-    },
-
-    // The oldest unprocessed rows, in queue order, for the apply scheduler to choose from.
-    unprocessedHead(limit) {
-      return selectHeadRows.all(limit).map((row) => ({
-        subject: row.subject,
-        position: row.position,
-        id: row.id,
-        package: JSON.parse(row.package_json),
-        attempts: row.attempts,
-      }))
-    },
-
-    hasUnprocessed() {
-      return selectUnprocessedCount.get().count > 0
-    },
-
-    setUnprocessedAttempts(subject, id, attempts) {
-      updateAttempts.run(attempts, subject, id)
-    },
-
-    removeUnprocessed(subject, id) {
-      deleteUnprocessed.run(subject, id)
-    },
-
-    recordFailure({ subject, position, id, clientId, kind, error, failedAt }) {
-      insertFailure.run(subject, position ?? null, id, clientId || "", kind, error, failedAt)
-    },
-
-    failedEntries(subject) {
-      return selectFailures.all(subject).map((row) => ({
-        id: row.id,
-        position: row.position,
-        clientId: row.client_id || null,
-        kind: row.kind,
-        error: row.error,
-        failedAt: row.failed_at,
-      }))
-    },
-
-    sendFailure(subject, clientId, id) {
-      return selectSendFailure.get(subject, id, clientId) || null
-    },
-
-    sendAttempts(subject, clientId, id) {
-      return selectSendAttempt.get(subject, clientId, id)?.attempts || 0
-    },
-
-    incrementSendAttempts(subject, clientId, id) {
-      const current = selectSendAttempt.get(subject, clientId, id)
-      const next = current ? current.attempts + 1 : 1
-      if (current) updateSendAttempt.run(next, subject, clientId, id)
-      else insertSendAttempt.run(subject, clientId, id, next)
-      return next
-    },
-
-    beginBlob() {
-      const directory = path.join(dataDir, "tmp")
-      mkdirSync(directory, { recursive: true })
-      return path.join(directory, `${randomUUID()}.tmp`)
-    },
-
-    discardBlob(file) {
-      rmSync(file, { force: true })
-    },
-
-    commitBlob(upload, tempPath) {
-      const destination = blobFile(upload)
-      mkdirSync(path.dirname(destination), { recursive: true })
-      renameSync(tempPath, destination)
-    },
-
-    requireBlob(upload, size) {
-      let info
+    // A PUT streams into a temp file, which becomes uploads/<upload> once fully written.
+    uploadTemp: () => path.join(uploads, `.${randomUUID()}.tmp`),
+    commitUpload: (upload, temp) => renameSync(temp, uploadFile(upload)),
+    discard: (temp) => rmSync(temp, { force: true }),
+    uploadSize(upload) {
       try {
-        info = statSync(blobFile(upload))
-      } catch (error) {
-        if (error.code === "ENOENT") throw attachmentError("ATTACHMENT_NOT_FOUND", `ATTACHMENT_NOT_FOUND upload ${upload}`)
-        throw error
-      }
-      if (info.size !== size) {
-        throw attachmentError("ATTACHMENT_SIZE_MISMATCH", `ATTACHMENT_SIZE_MISMATCH upload ${upload} expected ${size} actual ${info.size}`)
-      }
-    },
-
-    openBlob(upload) {
-      const file = blobFile(upload)
-      try {
-        return { file, size: statSync(file).size }
+        return statSync(uploadFile(upload)).size
       } catch (error) {
         if (error.code === "ENOENT") return null
         throw error
       }
     },
+    uploadPath: (upload) => uploadFile(upload),
+    readUpload: (upload) => new Uint8Array(readFileSync(uploadFile(upload))),
+    dropUpload: (upload) => rmSync(uploadFile(upload), { force: true }),
 
-    readBlob(upload) {
-      return readFileSync(blobFile(upload))
-    },
-
-    dropBlob(upload) {
-      rmSync(blobFile(upload), { force: true })
-    },
-
-
-    close() {
-      db.close()
-    },
-  }
-}
-
-function requireUpload(upload) {
-  if (typeof upload !== "string" || !/^[0-9a-f-]{16,64}$/.test(upload)) throw new TypeError("upload is invalid")
-  return upload
-}
-
-function attachmentError(code, message) {
-  const error = new Error(message)
-  error.code = code
-  return error
-}
-
-function logRow(row) {
-  return {
-    id: row.id,
-    position: row.position,
-    package: JSON.parse(row.package_json),
-    clientId: row.client_id || null,
-    base: Number.isInteger(row.base_position) ? row.base_position : null,
+    close: () => db.close(),
   }
 }
