@@ -222,3 +222,21 @@ test("the queue is one file per change, and the pointer and failures sit beside 
   assert.deepEqual(await readdir(path.join(root, "a", encodeURIComponent(subject), "outbox")), [])
   assert.equal(await readFile(path.join(root, "a", encodeURIComponent(subject), "pointer"), "utf8"), "2")
 })
+
+test("a change added while a sync waits on the network is kept, and goes with the next sync", async (t) => {
+  const root = await tempDir(t)
+  const { server, url, applied } = await startServer(t, root)
+  let release
+  const stalled = new Promise((resolve) => { release = resolve })
+  let first = true
+  const slow = (real) => ({ ...real, post: async (body) => { if (first) { first = false; await stalled; throw Object.assign(new Error("dropped"), { offline: true }) } return real.post(body) } })
+  const a = await startClient(root, "a", url, hostFiles(), { wrap: slow })
+  await a.client.appendChanges({ data: "first" })
+  const sending = a.client.sync().catch((error) => error)
+  await a.client.appendChanges({ data: "second" })
+  release()
+  assert.match((await sending).message, /dropped/)
+  await a.client.sync()
+  await server.whenIdle()
+  assert.deepEqual(applied, ["first", "second"])
+})
