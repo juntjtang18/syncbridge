@@ -57,6 +57,7 @@ export function createNodeServerStorage(dataDir) {
   }
 
   const selectById = db.prepare("SELECT position FROM log_entries WHERE subject = ? AND id = ?")
+  const selectUnprocessedUsingBlob = db.prepare("SELECT 1 FROM unprocessed WHERE package_json LIKE ? LIMIT 1")
   const selectEntry = db.prepare("SELECT package_json FROM log_entries WHERE subject = ? AND id = ?")
   const selectCounter = db.prepare("SELECT next_position FROM subject_counters WHERE subject = ?")
   const insertCounter = db.prepare("INSERT INTO subject_counters (subject, next_position) VALUES (?, ?)")
@@ -357,6 +358,10 @@ export function createNodeServerStorage(dataDir) {
 
     dropBlob(expectedHash) {
       rmSync(blobFile(expectedHash), { force: true })
+    },
+
+    unprocessedUsesBlob(expectedHash) {
+      return Boolean(selectUnprocessedUsingBlob.get(`%"sha256":"${requireHash(expectedHash)}"%`))
     },
 
     close() {

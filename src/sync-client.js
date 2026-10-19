@@ -83,10 +83,16 @@ export function createClient({ storage, transport, sha256, randomId, log }) {
           await storage.writeUnprocessed(targetDigest, rows)
         })
       }
-      for (const manifest of row.package.attachments || []) {
-        if (manifest.sha256) await storage.dropBlob(targetDigest, manifest.sha256)
-      }
-      await removeUnprocessed(targetDigest, row.id)
+      // Staging is stored by content: keep it while a change still waiting carries the same bytes.
+      // Under the queue lock, as saveReceived stages and enqueues, so none slips between the two.
+      await withQueue(async () => {
+        const rows = (await storage.readUnprocessed(targetDigest)).filter((item) => item.id !== row.id)
+        await storage.writeUnprocessed(targetDigest, rows)
+        const waiting = new Set(rows.flatMap((item) => (item.package.attachments || []).map((manifest) => manifest.sha256)))
+        for (const manifest of row.package.attachments || []) {
+          if (manifest.sha256 && !waiting.has(manifest.sha256)) await storage.dropBlob(targetDigest, manifest.sha256)
+        }
+      })
       trace(sink, { side: "client", subject: loggedSubject, step: "applied", id: row.id, attempt })
     } catch (error) {
       const attempts = (row.attempts || 0) + 1
@@ -517,12 +523,14 @@ async function ingest(response, context) {
 
 async function saveReceived(context, entry) {
   const attachments = entry.package?.attachments || []
+  const downloaded = []
   for (const manifest of attachments) {
     if (!manifest?.sha256) throw new Error(`attachment for ${manifest?.id || "unknown"} is missing`)
-    const bytes = await context.transport.get(manifest.sha256)
-    await context.storage.putBlob(context.digest, manifest.sha256, bytes)
+    downloaded.push([manifest.sha256, await context.transport.get(manifest.sha256)])
   }
   await context.withQueue(async () => {
+    // Staged and enqueued together: an apply of the same bytes cannot delete the staging between.
+    for (const [hash, bytes] of downloaded) await context.storage.putBlob(context.digest, hash, bytes)
     const rows = await context.storage.readUnprocessed(context.digest)
     if (rows.some((row) => row.id === entry.id)) return
     rows.push({ id: entry.id, position: entry.position, package: entry.package, attempts: 0, ...(entry.own ? { own: true } : {}) })

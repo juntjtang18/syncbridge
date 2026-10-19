@@ -660,3 +660,89 @@ async function tempDirs(t) {
     client: path.join(root, "client"),
   }
 }
+
+test("e2e: two waiting changes with the same bytes both apply, then staging is deleted", async (t) => {
+  const dirs = await tempDirs(t)
+  const photo = Buffer.from("same-photo")
+  const store = createHostStore([["a.jpg", photo], ["b.jpg", photo]])
+  const applied = []
+  const server = createSyncServer({ dataDir: dirs.server, currentSubject() { return subjectA } })
+  t.after(() => server.close())
+  const endpoints = await listen(server, t)
+  server.init(subjectA, async (entry, attachments) => {
+    const id = entry.package.attachments[0].id
+    applied.push([id, Buffer.from(await attachments.get(id).read()).toString()])
+    store.put(`server/${id}.jpg`, photo)
+    return { attachments: [{ id, path: `server/${id}.jpg` }] }
+  }, { readAttachment: store.readAttachment })
+
+  const client = createSyncClient({ dataDir: dirs.client, url: endpoints.url })
+  await client.use(subjectA, async () => {}, { readAttachment: store.readAttachment })
+  await client.appendChanges({ data: "first", attachments: [{ id: "photo-1", path: "a.jpg", contentType: "image/jpeg" }] })
+  await client.appendChanges({ data: "second", attachments: [{ id: "photo-2", path: "b.jpg", contentType: "image/jpeg" }] })
+  await client.sync()
+  await server.whenIdle()
+  await client.whenIdle()
+  assert.deepEqual(applied, [["photo-1", "same-photo"], ["photo-2", "same-photo"]])
+  await assertNoServerStaging(dirs.server)
+
+  // A receiver downloads both: its staging of the shared bytes stays until the second is applied.
+  const received = []
+  const receiverDir = path.join(path.dirname(dirs.client), "receiver")
+  const receiver = createSyncClient({ dataDir: receiverDir, url: endpoints.url })
+  await receiver.use(subjectA, async (entry, attachments) => {
+    const id = entry.package.attachments[0].id
+    received.push([id, Buffer.from(await attachments.get(id).read()).toString()])
+  }, { readAttachment: store.readAttachment })
+  await receiver.sync()
+  await receiver.whenIdle()
+  assert.deepEqual(received, [["photo-1", "same-photo"], ["photo-2", "same-photo"]])
+  await assertNoClientStaging(receiverDir)
+})
+
+test("e2e: an upload whose staging another client's apply deleted reads the stored copy", async (t) => {
+  const dirs = await tempDirs(t)
+  const photo = Buffer.from("shared-photo")
+  const store = createHostStore([["a.jpg", photo], ["b.jpg", photo]])
+  const applied = []
+  const server = createSyncServer({ dataDir: dirs.server, currentSubject() { return subjectA } })
+  t.after(() => server.close())
+  const endpoints = await listen(server, t)
+  server.init(subjectA, async (entry, attachments) => {
+    const id = entry.package.attachments[0].id
+    applied.push([id, Buffer.from(await attachments.get(id).read()).toString()])
+    store.put(`server/${id}.jpg`, photo)
+    return { attachments: [{ id, path: `server/${id}.jpg` }] }
+  }, { readAttachment: store.readAttachment })
+
+  // Client B uploads its photo, and before B sends its change, client A's change with the same
+  // bytes is applied, which deletes the shared staging.
+  const real = createHttpTransport({ url: endpoints.url })
+  let beforePost = async () => {}
+  const clientB = createClient({
+    storage: createNodeClientStorage(path.join(path.dirname(dirs.client), "client-b")),
+    transport: {
+      async post(body) { await beforePost(); return real.post(body) },
+      put: (body) => real.put(body),
+      get: (hash) => real.get(hash),
+    },
+    sha256,
+    randomId,
+  })
+  await clientB.use(subjectA, async () => {}, { readAttachment: store.readAttachment })
+  await clientB.appendChanges({ data: "from B", attachments: [{ id: "photo-b", path: "b.jpg", contentType: "image/jpeg" }] })
+
+  const clientA = createSyncClient({ dataDir: dirs.client, url: endpoints.url })
+  await clientA.use(subjectA, async () => {}, { readAttachment: store.readAttachment })
+  await clientA.appendChanges({ data: "from A", attachments: [{ id: "photo-a", path: "a.jpg", contentType: "image/jpeg" }] })
+  beforePost = async () => {
+    beforePost = async () => {}
+    await clientA.sync()
+    await server.whenIdle()
+    await assertNoServerStaging(dirs.server)
+  }
+  await clientB.sync()
+  await server.whenIdle()
+  assert.deepEqual(applied, [["photo-a", "shared-photo"], ["photo-b", "shared-photo"]])
+  await assertNoServerStaging(dirs.server)
+})
