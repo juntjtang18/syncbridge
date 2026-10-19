@@ -6,6 +6,8 @@ export const SYNC_LIMITS = {
   sendBatch: 20,
   // Entries in one ack. A client far behind (a new phone) catches up page by page, with progress.
   receivePage: 200,
+  // Attachments downloaded at once while receiving; changes are still applied one by one in order.
+  downloads: 4,
   // Server applies in flight at once. An apply mostly waits on the host's storage (a Drive upload is
   // about a second), so a few at once multiply throughput on one thread. Drive allows ~3 writes/s.
   applyConcurrency: 3,

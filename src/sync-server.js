@@ -117,7 +117,7 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
     }
     if (!callbacks.has(subject)) throw new Error(`subject is not initialized: ${subject}`)
     const pointer = Number.isInteger(body.pointer) && body.pointer >= 0 ? body.pointer : 0
-    const page = Number.isInteger(body.page) && body.page > 0 ? body.page : SYNC_LIMITS.receivePage
+    const page = Number.isInteger(body.page) && body.page >= 0 ? body.page : SYNC_LIMITS.receivePage
     const acceptedIds = []
     let refused
     for (const change of Array.isArray(body.changes) ? body.changes : []) {

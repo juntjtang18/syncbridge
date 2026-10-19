@@ -32,7 +32,9 @@ log, in the same order. Applications apply each change; the last one logged wins
      `sha256` and `size`, and keep `upload`, `sha256`, `size` on the change's outbox file at once
      (a stop re-uploads nothing already up);
    - `POST` the batch with the pointer; delete the accepted changes from the outbox;
-   - apply each returned entry in order, then set the pointer to its position.
+   - while changes are left to send, ask for no entries (`page: 0`): send first, then receive;
+   - apply each returned entry in order, then set the pointer to its position. Attachments are
+     downloaded a few at a time (`downloads`, 4) ahead of the applies.
 9. Applying an entry: download each attachment (`GET`), check its hash and size, call
    `applyChange(entry, attachments)`. `entry.own` is true for this client's own changes, which come
    back in log order without attachments.
@@ -73,6 +75,6 @@ log, in the same order. Applications apply each change; the last one logged wins
 
 ## 4. Limits
 
-18. `SYNC_LIMITS` in `src/limits.js`: `sendBatch` 20, `receivePage` 200, `applyConcurrency` 3.
+18. `SYNC_LIMITS` in `src/limits.js`: `sendBatch` 20, `receivePage` 200, `downloads` 4, `applyConcurrency` 3.
 19. Accepted limitation: a server apply that fails 3 times leaves the host's storage without that
     change while clients have it, until someone fixes the cause.

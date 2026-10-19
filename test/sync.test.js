@@ -240,3 +240,27 @@ test("a change added while a sync waits on the network is kept, and goes with th
   await server.whenIdle()
   assert.deepEqual(applied, ["first", "second"])
 })
+
+test("a phone sends its whole queue before it receives, and downloads a few attachments at once", async (t) => {
+  const root = await tempDir(t)
+  const files = hostFiles(Object.fromEntries(Array.from({ length: 12 }, (_, index) => [`${index}.jpg`, `photo-${index}`])))
+  const { server, url } = await startServer(t, root)
+  const a = await startClient(root, "a", url, files)
+  for (let index = 0; index < 12; index += 1) await a.client.appendChanges(photo(`a${index}`, `${index}.jpg`))
+  await a.client.sync()
+  await server.whenIdle()
+  const pages = []
+  let active = 0
+  let most = 0
+  const watch = (real) => ({
+    ...real,
+    post: async (body) => { const answer = await real.post(body); pages.push([body.changes.length, body.page, answer.entries.length]); return answer },
+    get: async (...args) => { active += 1; most = Math.max(most, active); await new Promise((resolve) => setTimeout(resolve, 20)); try { return await real.get(...args) } finally { active -= 1 } },
+  })
+  const b = await startClient(root, "b", url, files, { wrap: watch, sendBatch: 2 })
+  for (let index = 0; index < 3; index += 1) await b.client.appendChanges({ data: `b${index}` })
+  await b.client.sync()
+  assert.deepEqual(pages, [[2, 0, 0], [1, 0, 0], [0, 200, 15]])
+  assert.equal(most, 4)
+  assert.deepEqual(b.applied.map((item) => item.data), [...Array.from({ length: 12 }, (_, index) => `a${index}`), "b0", "b1", "b2"])
+})

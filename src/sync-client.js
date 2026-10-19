@@ -7,7 +7,7 @@ import { createLog, trace } from "./log.js"
 // every logged change after this install's pointer, in log order, moving the pointer as it goes.
 // A change that fails three times (refused by the server, or not applied here) goes on the failure
 // list and the sync moves on. A network failure ends the sync; the next one resumes where it stopped.
-export function createClient({ storage, transport, sha256, randomId, log, sendBatch = SYNC_LIMITS.sendBatch, receivePage = SYNC_LIMITS.receivePage }) {
+export function createClient({ storage, transport, sha256, randomId, log, sendBatch = SYNC_LIMITS.sendBatch, receivePage = SYNC_LIMITS.receivePage, downloads = SYNC_LIMITS.downloads }) {
   const sink = createLog(log)
   const listeners = new Set()
   let progress = { sent: 0, uploaded: 0, toSend: 0, received: 0, toReceive: 0 }
@@ -59,16 +59,23 @@ export function createClient({ storage, transport, sha256, randomId, log, sendBa
     await storage.remove(name)
   }
 
-  // Downloads, checks and applies each entry, then moves the pointer past it.
+  // An entry's attachments, each checked against its hash.
+  async function download(entry) {
+    const files = new Map()
+    for (const manifest of entry.package.attachments) {
+      const bytes = await transport.get(subject, entry.id, manifest.id)
+      if (await sha256(bytes) !== manifest.sha256 || bytes.byteLength !== manifest.size) throw new Error(`attachment ${manifest.id} arrived changed`)
+      files.set(manifest.id, bytes)
+    }
+    return files
+  }
+
+  // Applies each entry in order and moves the pointer past it. Downloads run ahead, a few at once.
   async function receive(entries) {
-    for (const entry of entries) {
+    const fetched = ahead(entries, downloads, (entry) => download(entry))
+    for (const [index, entry] of entries.entries()) {
       const failure = await tryThrice(async () => {
-        const files = new Map()
-        for (const manifest of entry.package.attachments) {
-          const bytes = await transport.get(subject, entry.id, manifest.id)
-          if (await sha256(bytes) !== manifest.sha256 || bytes.byteLength !== manifest.size) throw new Error(`attachment ${manifest.id} arrived changed`)
-          files.set(manifest.id, bytes)
-        }
+        const files = await fetched[index].retry()
         await applyChange(entry, attachmentReader(entry.package.attachments, (manifest) => files.get(manifest.id)))
       })
       if (failure) {
@@ -111,7 +118,8 @@ export function createClient({ storage, transport, sha256, randomId, log, sendBa
           for (const item of batch) await upload(item)
           const pointer = await storage.pointer()
           trace(sink, { side: "client", subject, step: "post", detail: { pointer, ids: batch.map((item) => item.row.id) } })
-          const answer = await transport.post({ subject, pointer, clientId, changes: batch.map((item) => item.row), page: receivePage })
+          // While changes are left to send, take no entries back: send first, then receive.
+          const answer = await transport.post({ subject, pointer, clientId, changes: batch.map((item) => item.row), page: batch.length ? 0 : receivePage })
           const accepted = new Set(answer.acceptedIds)
           for (const item of batch) if (accepted.has(item.row.id)) await storage.remove(item.name)
           if (answer.refused) await refused(batch.find((item) => item.row.id === answer.refused.id), answer.refused.error)
@@ -135,3 +143,32 @@ export function createClient({ storage, transport, sha256, randomId, log, sendBa
     },
   }
 }
+
+// Starts work(item) for each item, at most `limit` at a time, in order. Each result is
+// { retry() }: the first call returns the started work's outcome, a later call runs it again
+// (so a failed download is tried afresh by the caller's retries).
+function ahead(items, limit, work) {
+  let active = 0
+  const waiting = []
+  const start = () => {
+    while (active < limit && waiting.length) {
+      const next = waiting.shift()
+      active += 1
+      next().finally(() => { active -= 1; start() })
+    }
+  }
+  return items.map((item) => {
+    let first = new Promise((resolve, reject) => waiting.push(() => work(item).then(resolve, reject)))
+    first.catch(() => {})
+    start()
+    return {
+      retry() {
+        if (!first) return work(item)
+        const result = first
+        first = null
+        return result
+      },
+    }
+  })
+}
+
