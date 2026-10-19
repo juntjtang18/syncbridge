@@ -167,7 +167,7 @@ test("a client far behind downloads in pages and reports its progress", async (t
   assert.equal(result.status, "succeed")
   assert.deepEqual(pages, [200, 200, 50])
   assert.deepEqual(received, Array.from({ length: 450 }, (_, index) => index))
-  assert.deepEqual(seen.at(-1), { sent: 0, toSend: 0, received: 450, toReceive: 450, applying: 0 })
+  assert.deepEqual(seen.at(-1), { sent: 0, uploaded: 0, toSend: 0, received: 450, toReceive: 450, applying: 0 })
   assert.ok(seen.some((progress) => progress.received === 200 && progress.toReceive === 450))
 })
 
@@ -205,4 +205,36 @@ test("a change the server cannot apply shows in the sender's failed entries", as
   assert.match(failed[0].error, /apply failed after 3 attempts: drive refused/)
   await sender.client.sync()
   assert.equal((await sender.client.failedEntries()).length, 1, "reported once")
+})
+
+test("a batch on a slow network is sent with the changes whose photos are up", async (t) => {
+  const files = Array.from({ length: 6 }, (_, index) => [`p${index}.jpg`, `slow-${index}`])
+  const { root, store, applied, server, endpoints } = await setup(t, files)
+  const real = createHttpTransport({ url: endpoints.url })
+  const posts = []
+  const client = createClient({
+    storage: createNodeClientStorage(path.join(root, "client")),
+    transport: {
+      post(body) { posts.push(body.changes.length); return real.post(body) },
+      async put(body) { await new Promise((resolve) => setTimeout(resolve, 40)); return real.put(body) },
+      has: () => false,
+      get: (hash) => real.get(hash),
+    },
+    sha256,
+    randomId,
+    sendSeconds: 0.06,
+  })
+  await client.use(subject, async () => {}, { readAttachment: store.readAttachment })
+  for (let index = 0; index < 6; index += 1) {
+    await client.appendChanges({ data: index, attachments: [{ id: `photo-${index}`, path: `p${index}.jpg`, contentType: "image/jpeg" }] })
+  }
+  const uploaded = []
+  client.onProgress((progress) => uploaded.push(progress.uploaded))
+  await client.sync()
+  await server.whenIdle()
+  assert.ok(posts.length >= 3, `posted in ${posts.join("/")}`)
+  assert.ok(posts.every((size) => size >= 1 && size <= 2), `posted in ${posts.join("/")}`)
+  assert.equal(posts.reduce((sum, size) => sum + size, 0), 6)
+  assert.deepEqual(applied, [0, 1, 2, 3, 4, 5])
+  assert.ok(uploaded.includes(1) && uploaded.includes(6), "progress moves photo by photo")
 })
