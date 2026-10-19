@@ -228,7 +228,11 @@ async function dispatch(req, res, storage, callbacks, currentSubject, wake, log)
     await handleGet(req, res, storage, callbacks, currentSubject, query, log)
     return
   }
-  res.writeHead(405, { Allow: "GET, POST, PUT" })
+  if (req.method === "HEAD") {
+    await handleHead(res, storage, currentSubject, req, query)
+    return
+  }
+  res.writeHead(405, { Allow: "GET, HEAD, POST, PUT" })
   res.end()
 }
 
@@ -419,6 +423,16 @@ function publicEntry(row) {
 
 function changesOf(body) {
   return Array.isArray(body.changes) ? body.changes : []
+}
+
+// HEAD /sync?sha256=: 200 when the host already holds these bytes, as a PUT staging or as the stored
+// copy of an applied change in the live subject's log, so a client need not upload them again.
+async function handleHead(res, storage, currentSubject, req, query) {
+  const hash = requireSha256(query)
+  let held = Boolean(storage.openBlob(hash))
+  if (!held && currentSubject !== undefined) held = Boolean(storage.findAttachment(requireSubject(await currentSubject(req)), hash))
+  res.writeHead(held ? 200 : 404)
+  res.end()
 }
 
 async function handleGet(req, res, storage, callbacks, currentSubject, query, log) {

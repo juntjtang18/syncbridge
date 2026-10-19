@@ -41,9 +41,9 @@ Two `sync()` calls still run one after another. Each pass claims `inflight`:
 - If `inflight/` has files, that list is the pass. `incoming/` is left alone.
 - If `inflight/` is empty, each `incoming/` file is renamed into `inflight/`. A file that appears after that listing stays in `incoming/` until the next pass.
 
-`selectBatch` is unchanged. A row with `attempts > 0` blocks later `inflight` rows. Those later rows stay in `inflight/`. New photos stay in `incoming/` until `inflight/` is empty.
+`selectBatch` takes at most `sendBatch` rows (100), oldest first. A row with `attempts > 0` blocks later `inflight` rows. Those later rows stay in `inflight/`. New photos stay in `incoming/` until `inflight/` is empty.
 
-After the attachment upload, the hash and size are written onto the claimed `inflight` files only. Accepted ids delete those files. A send failure updates or deletes that one `inflight` file. None of these rewrite `incoming/`.
+Each change's hash and size are written onto its claimed `inflight` file as soon as that change's attachments are up, before the next change uploads, so a stop part way re-uploads nothing already sent. Bytes the host already holds (`HEAD /sync?sha256=` is 200) are not uploaded: the client hashes them, fills the manifest, and moves on. These writes touch claimed `inflight` files only. Accepted ids delete those files. A send failure updates or deletes that one `inflight` file. None of these rewrite `incoming/`.
 
 The loop claims again after a pass. A photo saved while this `sync()` is open goes out before `sync()` returns when the app stays up.
 

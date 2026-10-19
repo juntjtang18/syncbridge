@@ -56,6 +56,40 @@ export function createNodeServerStorage(dataDir) {
     db.exec("ALTER TABLE log_entries ADD COLUMN base_position INTEGER")
   }
 
+  // Which logged changes carry which bytes: one indexed lookup answers "does the host hold these bytes,
+  // and through which change's stored path". It indexes the log only; the bytes stay with the host.
+  const indexed = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'log_attachments'").get()
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS log_attachments (
+      subject TEXT NOT NULL,
+      sha256 TEXT NOT NULL,
+      size INTEGER NOT NULL,
+      entry_id TEXT NOT NULL,
+      PRIMARY KEY (subject, sha256, entry_id)
+    )
+  `)
+  const insertAttachment = db.prepare("INSERT OR IGNORE INTO log_attachments (subject, sha256, size, entry_id) VALUES (?, ?, ?, ?)")
+  const deleteAttachments = db.prepare("DELETE FROM log_attachments WHERE subject = ? AND entry_id = ?")
+  // A change that carries the bytes and is applied (so its path is the host's stored copy), oldest first.
+  const selectStoredAttachment = db.prepare(`
+    SELECT a.entry_id FROM log_attachments a
+    WHERE a.subject = ? AND a.sha256 = ?
+      AND NOT EXISTS (SELECT 1 FROM unprocessed u WHERE u.subject = a.subject AND u.id = a.entry_id)
+    ORDER BY a.rowid LIMIT 1
+  `)
+  function indexAttachments(subject, id, packageValue) {
+    for (const manifest of packageValue.attachments || []) {
+      if (manifest && typeof manifest.sha256 === "string" && Number.isInteger(manifest.size)) insertAttachment.run(subject, manifest.sha256, manifest.size, id)
+    }
+  }
+  if (!indexed) {
+    db.transaction(() => {
+      for (const row of db.prepare("SELECT subject, id, package_json FROM log_entries ORDER BY subject, position").all()) {
+        indexAttachments(row.subject, row.id, JSON.parse(row.package_json))
+      }
+    })()
+  }
+
   const selectById = db.prepare("SELECT position FROM log_entries WHERE subject = ? AND id = ?")
   const selectUnprocessedUsingBlob = db.prepare("SELECT 1 FROM unprocessed WHERE package_json LIKE ? LIMIT 1")
   const selectEntry = db.prepare("SELECT package_json FROM log_entries WHERE subject = ? AND id = ?")
@@ -81,12 +115,6 @@ export function createNodeServerStorage(dataDir) {
   const selectOrigin = db.prepare("SELECT client_id, base_position FROM log_entries WHERE subject = ? AND id = ?")
   const selectTip = db.prepare("SELECT MAX(position) AS position FROM log_entries WHERE subject = ?")
   const deleteEntry = db.prepare("DELETE FROM log_entries WHERE subject = ? AND id = ? AND position = ?")
-  const selectPackages = db.prepare(`
-    SELECT package_json
-    FROM log_entries
-    WHERE subject = ?
-    ORDER BY position DESC
-  `)
   const selectEntryById = db.prepare(`
     SELECT id, position, package_json
     FROM log_entries
@@ -149,6 +177,7 @@ export function createNodeServerStorage(dataDir) {
     if (counter) updateCounter.run(position + 1, subject)
     else insertCounter.run(subject, position + 1)
     insertEntry.run(subject, position, id, JSON.stringify(packageValue), clientId || null, Number.isInteger(base) ? base : null)
+    indexAttachments(subject, id, packageValue)
     return { duplicate: false, position }
   })
 
@@ -156,6 +185,7 @@ export function createNodeServerStorage(dataDir) {
     const tip = selectTip.get(subject)
     if (!tip || tip.position !== position) throw new Error("cannot roll back a log entry that is not the tip")
     deleteEntry.run(subject, id, position)
+    deleteAttachments.run(subject, id)
     updateCounter.run(position, subject)
   })
 
@@ -187,14 +217,12 @@ export function createNodeServerStorage(dataDir) {
       return selectAfter.all(subject, pointer).map(logRow)
     },
 
+    // The manifest of an applied change carrying these bytes: its path is the host's stored copy.
     findAttachment(subject, hash) {
-      requireHash(hash)
-      for (const row of selectPackages.all(subject)) {
-        const packageValue = JSON.parse(row.package_json)
-        const manifest = (packageValue.attachments || []).find((item) => item && item.sha256 === hash)
-        if (manifest) return manifest
-      }
-      return null
+      const row = selectStoredAttachment.get(subject, requireHash(hash))
+      if (!row) return null
+      const entry = selectEntry.get(subject, row.entry_id)
+      return (JSON.parse(entry.package_json).attachments || []).find((item) => item && item.sha256 === hash) || null
     },
 
     updateAttachmentPaths(subject, id, updates) {

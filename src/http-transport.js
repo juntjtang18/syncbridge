@@ -38,6 +38,16 @@ export function createHttpTransport({ url, headers }) {
       return parsed
     },
 
+    // Whether the server already holds these bytes (HEAD /sync?sha256=). Unsure means no: upload.
+    async has(hash) {
+      try {
+        const { status } = await send({ url: withHash(url, hash), method: "HEAD", headers: await requestHeaders(headers), withStatus: true })
+        return status === 200
+      } catch {
+        return false
+      }
+    },
+
     async get(hash, filePath) {
       const body = await send({
         url: withHash(url, hash),

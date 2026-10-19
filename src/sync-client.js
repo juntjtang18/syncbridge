@@ -5,11 +5,12 @@ import {
   requireReadAttachment,
   requireSubject,
 } from "./client-contracts.js"
+import { SYNC_LIMITS } from "./limits.js"
 import { createLog, trace } from "./log.js"
 
 const ATTEMPT_LIMIT = 3
 
-export function createClient({ storage, transport, sha256, randomId, log }) {
+export function createClient({ storage, transport, sha256, randomId, log, sendBatch = SYNC_LIMITS.sendBatch }) {
   if (typeof sha256 !== "function") throw new TypeError("sha256 must be a function")
   if (typeof randomId !== "function") throw new TypeError("randomId must be a function")
 
@@ -241,12 +242,12 @@ export function createClient({ storage, transport, sha256, randomId, log }) {
         let pulled = false
         for (;;) {
           const inflight = await storage.claimInflight(digest)
-          const batch = selectBatch(inflight)
+          const batch = selectBatch(inflight, sendBatch)
           if (batch.length === 0 && pulled) return { status: "succeed", subject }
           if (batch.length > 0) {
             try {
-              await fillHashes(batch, readAttachment, transport, sink, subject)
-              for (const row of batch) await storage.writeInflight(digest, row)
+              await fillHashes(batch, readAttachment, transport, sink, subject, sha256,
+                (row) => storage.writeInflight(digest, row))
             } catch (error) {
               trace(sink, { side: "client", subject, step: "put", id: batch[0]?.id, status: "failed", error: messageOf(error) })
               const capped = await failSend(storage, digest, batch[0], messageOf(error), sink, subject)
@@ -419,10 +420,11 @@ function queuePackage(value) {
   }
 }
 
-function selectBatch(records) {
+// The oldest rows, at most `limit`. A row that failed before goes last: nothing after it is sent.
+function selectBatch(records, limit) {
   const heldIndex = records.findIndex((row) => (row.attempts || 0) > 0)
-  if (heldIndex === -1) return records
-  return records.slice(0, heldIndex + 1)
+  const upTo = heldIndex === -1 ? records.length : heldIndex + 1
+  return records.slice(0, Math.min(upTo, limit))
 }
 
 async function failSend(storage, digest, record, detail, log, subject) {
@@ -580,11 +582,26 @@ async function adoptSwitch(response, storage, state) {
   return { status: "switched", switched: true, subject: live }
 }
 
-async function fillHashes(changes, readAttachment, transport, log, subject) {
+// Uploads each change's attachments and writes the hashes onto that change's inflight file as soon
+// as they are up (`saved`), so a stop part way re-uploads nothing already sent. Bytes the server
+// already holds (same hash) are not uploaded again.
+async function fillHashes(changes, readAttachment, transport, log, subject, sha256, saved) {
   for (const change of changes) {
+    let changed = false
     for (const manifest of change.package.attachments) {
       if (manifest.sha256 && Number.isInteger(manifest.size)) continue
       if (!readAttachment) throw new Error("readAttachment is required")
+      const body = await readAttachment(manifest)
+      if (body instanceof Uint8Array && typeof transport.has === "function") {
+        const hash = await sha256(body)
+        if (await transport.has(hash)) {
+          manifest.sha256 = hash
+          manifest.size = body.byteLength
+          changed = true
+          trace(log, { side: "client", subject, step: "put", id: change.id, status: "held", detail: { attachmentId: manifest.id, sha256: hash, size: body.byteLength } })
+          continue
+        }
+      }
       trace(log, {
         side: "client",
         subject,
@@ -592,7 +609,7 @@ async function fillHashes(changes, readAttachment, transport, log, subject) {
         id: change.id,
         detail: { attachmentId: manifest.id, path: manifest.path },
       })
-      const uploaded = await transport.put(await readAttachment(manifest))
+      const uploaded = await transport.put(body)
       if (uploaded?.status === "failed" || uploaded?.status === "error") {
         throw new Error(uploaded.error || "attachment upload failed")
       }
@@ -601,6 +618,7 @@ async function fillHashes(changes, readAttachment, transport, log, subject) {
       }
       manifest.sha256 = uploaded.sha256
       manifest.size = uploaded.size
+      changed = true
       trace(log, {
         side: "client",
         subject,
@@ -610,6 +628,7 @@ async function fillHashes(changes, readAttachment, transport, log, subject) {
         detail: { attachmentId: manifest.id, sha256: uploaded.sha256, size: uploaded.size },
       })
     }
+    if (changed) await saved(change)
   }
 }
 
