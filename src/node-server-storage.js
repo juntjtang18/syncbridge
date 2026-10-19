@@ -91,6 +91,13 @@ export function createNodeServerStorage(dataDir) {
   }
 
   const selectById = db.prepare("SELECT position FROM log_entries WHERE subject = ? AND id = ?")
+  const countUnprocessed = db.prepare("SELECT count(*) AS n FROM unprocessed WHERE subject = ?")
+  const selectApplyFailuresFor = db.prepare(`
+    SELECT f.id, f.position, f.error, f.failed_at FROM failed_entries f
+    JOIN log_entries l ON l.subject = f.subject AND l.id = f.id
+    WHERE f.subject = ? AND f.kind = 'apply' AND l.client_id = ?
+    ORDER BY f.position
+  `)
   const selectUnprocessedUsingBlob = db.prepare("SELECT 1 FROM unprocessed WHERE package_json LIKE ? LIMIT 1")
   const selectEntry = db.prepare("SELECT package_json FROM log_entries WHERE subject = ? AND id = ?")
   const selectCounter = db.prepare("SELECT next_position FROM subject_counters WHERE subject = ?")
@@ -283,6 +290,15 @@ export function createNodeServerStorage(dataDir) {
         package: JSON.parse(row.package_json),
         attempts: row.attempts,
       }
+    },
+
+    // Changes this client sent that the server could not apply, for the client's failure list.
+    applyFailuresFor(subject, clientId) {
+      return selectApplyFailuresFor.all(subject, clientId).map((row) => ({ id: row.id, position: row.position, error: row.error, failedAt: row.failed_at }))
+    },
+
+    unprocessedCount(subject) {
+      return countUnprocessed.get(subject).n
     },
 
     hasUnprocessed() {

@@ -139,3 +139,70 @@ test("an existing log is indexed by its attachments when the server storage open
   t.after(() => reopened.close())
   assert.deepEqual(reopened.findAttachment(subject, hash), { id: "p", path: "server/p", sha256: hash, size: 1 })
 })
+
+test("a client far behind downloads in pages and reports its progress", async (t) => {
+  const { root, store, server, endpoints } = await setup(t)
+  const sender = countingClient(path.join(root, "sender"), endpoints.url, store)
+  await sender.use()
+  for (let index = 0; index < 450; index += 1) await sender.client.appendChanges({ data: index })
+  await sender.client.sync()
+  await server.whenIdle()
+
+  const real = createHttpTransport({ url: endpoints.url })
+  const pages = []
+  const received = []
+  const receiver = createClient({
+    storage: createNodeClientStorage(path.join(root, "receiver")),
+    transport: { post: async (body) => { const ack = await real.post(body); pages.push(ack.entries.length); return ack }, put: (body) => real.put(body), get: (hash) => real.get(hash) },
+    sha256,
+    randomId,
+    receivePage: 200,
+  })
+  await receiver.use(subject, async (entry) => { received.push(entry.package.data) }, { readAttachment: store.readAttachment })
+  const seen = []
+  const stop = receiver.onProgress((progress) => seen.push(progress))
+  const result = await receiver.sync()
+  await receiver.whenIdle()
+  stop()
+  assert.equal(result.status, "succeed")
+  assert.deepEqual(pages, [200, 200, 50])
+  assert.deepEqual(received, Array.from({ length: 450 }, (_, index) => index))
+  assert.deepEqual(seen.at(-1), { sent: 0, toSend: 0, received: 450, toReceive: 450, applying: 0 })
+  assert.ok(seen.some((progress) => progress.received === 200 && progress.toReceive === 450))
+})
+
+test("a sender's progress counts its changes as they are acked", async (t) => {
+  const { root, store, server, endpoints } = await setup(t)
+  const sender = countingClient(path.join(root, "sender"), endpoints.url, store, { sendBatch: 100 })
+  await sender.use()
+  for (let index = 0; index < 250; index += 1) await sender.client.appendChanges({ data: index })
+  const seen = []
+  sender.client.onProgress((progress) => seen.push(`${progress.sent}/${progress.toSend}`))
+  await sender.client.sync()
+  await server.whenIdle()
+  assert.deepEqual(seen.filter((value, index) => seen.indexOf(value) === index).slice(0, 4), ["0/250", "100/250", "200/250", "250/250"])
+})
+
+test("a change the server cannot apply shows in the sender's failed entries", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "syncbridge-failed-"))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const store = createHostStore()
+  const server = createSyncServer({ dataDir: path.join(root, "server"), currentSubject() { return subject } })
+  t.after(() => server.close())
+  const endpoints = await listen(server, t)
+  server.init(subject, async (entry) => { if (entry.package.data === "bad") throw new Error("drive refused") }, { readAttachment: store.readAttachment })
+  const sender = countingClient(path.join(root, "sender"), endpoints.url, store)
+  await sender.use()
+  await sender.client.appendChanges({ data: "good" })
+  await sender.client.appendChanges({ data: "bad" })
+  await sender.client.sync()
+  await server.whenIdle()
+  assert.deepEqual(await sender.client.failedEntries(), [])
+  await sender.client.sync()
+  const failed = await sender.client.failedEntries()
+  assert.equal(failed.length, 1)
+  assert.equal(failed[0].side, "server")
+  assert.match(failed[0].error, /apply failed after 3 attempts: drive refused/)
+  await sender.client.sync()
+  assert.equal((await sender.client.failedEntries()).length, 1, "reported once")
+})

@@ -10,7 +10,7 @@ import { createLog, trace } from "./log.js"
 
 const ATTEMPT_LIMIT = 3
 
-export function createClient({ storage, transport, sha256, randomId, log, sendBatch = SYNC_LIMITS.sendBatch }) {
+export function createClient({ storage, transport, sha256, randomId, log, sendBatch = SYNC_LIMITS.sendBatch, receivePage = SYNC_LIMITS.receivePage }) {
   if (typeof sha256 !== "function") throw new TypeError("sha256 must be a function")
   if (typeof randomId !== "function") throw new TypeError("randomId must be a function")
 
@@ -26,6 +26,14 @@ export function createClient({ storage, transport, sha256, randomId, log, sendBa
   let drain = Promise.resolve()
   let queueLock = Promise.resolve()
   const draining = new Set()
+  // sync() progress: changes sent of those queued when it began, entries saved of those the server
+  // has for this client, and how many changes the server has yet to apply.
+  const progressListeners = new Set()
+  let progress = { sent: 0, toSend: 0, received: 0, toReceive: 0, applying: 0 }
+  function report(next) {
+    progress = { ...progress, ...next }
+    for (const listener of progressListeners) listener(progress)
+  }
   const seqByDigest = new Map()
 
   function withQueue(work) {
@@ -218,6 +226,12 @@ export function createClient({ storage, transport, sha256, randomId, log, sendBa
 
     whenIdle,
 
+    /** Calls `listener({ sent, toSend, received, toReceive, applying })` as a sync() moves. */
+    onProgress(listener) {
+      progressListeners.add(listener)
+      return () => { progressListeners.delete(listener) }
+    },
+
     appendChanges(input) {
       try {
         ready()
@@ -240,10 +254,12 @@ export function createClient({ storage, transport, sha256, randomId, log, sendBa
         ready()
         const clientId = await storage.ensureClientId()
         let pulled = false
+        let more = false
+        report({ sent: 0, toSend: (await storage.readOutbox(digest)).length, received: 0, toReceive: 0, applying: 0 })
         for (;;) {
           const inflight = await storage.claimInflight(digest)
           const batch = selectBatch(inflight, sendBatch)
-          if (batch.length === 0 && pulled) return { status: "succeed", subject }
+          if (batch.length === 0 && pulled && !more) return { status: "succeed", subject }
           if (batch.length > 0) {
             try {
               await fillHashes(batch, readAttachment, transport, sink, subject, sha256,
@@ -269,6 +285,7 @@ export function createClient({ storage, transport, sha256, randomId, log, sendBa
               pointer,
               changes: batch,
               clientId,
+              receivePage,
             })
           } catch (error) {
             trace(sink, { side: "client", subject, step: "error", error: messageOf(error) })
@@ -311,16 +328,25 @@ export function createClient({ storage, transport, sha256, randomId, log, sendBa
             throw new TypeError("sync response is invalid")
           }
           await storage.removeInflight(digest, response.acceptedIds)
+          more = response.more === true
+          await noteServerFailures(storage, digest, response.serverFailed)
+          report({
+            sent: progress.sent + response.acceptedIds.length,
+            toSend: Math.max(progress.toSend, progress.sent + response.acceptedIds.length),
+            toReceive: progress.received + (Number.isInteger(response.remaining) ? response.remaining : response.entries.length),
+            ...(Number.isInteger(response.applying) ? { applying: response.applying } : {}),
+          })
           await ingest(response, {
             storage, transport, digest, clientId, subject, withQueue, log: sink,
             wake: () => wake(digest, applyChange),
-            post: (body) => transport.post(body),
+            saved: () => report({ received: progress.received + 1 }),
+            post: (body) => transport.post({ ...body, receivePage }),
           })
           if (response.status === "failed" || response.status === "partial" || response.status === "error") {
             const left = await storage.readOutbox(digest)
             const rejected = left.find((row) => batch.some((item) => item.id === row.id))
             if (!rejected) {
-              if (left.length === 0) return { status: "succeed", subject }
+              if (left.length === 0 && !more) return { status: "succeed", subject }
               return { status: response.status, subject, error: response.error }
             }
             const capped = await failSend(storage, digest, rejected, response.error || response.status, sink, subject)
@@ -328,7 +354,7 @@ export function createClient({ storage, transport, sha256, randomId, log, sendBa
             continue
           }
           const left = await storage.readOutbox(digest)
-          if (left.length === 0) return { status: "succeed", subject }
+          if (left.length === 0 && !more) return { status: "succeed", subject }
         }
       })
     },
@@ -427,6 +453,19 @@ function selectBatch(records, limit) {
   return records.slice(0, Math.min(upTo, limit))
 }
 
+// The server's apply failures for this client's own changes join its failure list, once each, so
+// failedEntries() shows a change that reached the server but did not land there.
+async function noteServerFailures(storage, digest, reported) {
+  if (!Array.isArray(reported) || reported.length === 0) return
+  const failures = await storage.readFailures(digest)
+  const known = new Set(failures.map((row) => row.id))
+  const added = reported.filter((row) => row && typeof row.id === "string" && !known.has(row.id))
+  if (added.length === 0) return
+  await storage.writeFailures(digest, [...failures, ...added.map((row) => ({
+    id: row.id, position: row.position ?? null, side: "server", error: `server ${row.error}`, failedAt: row.failedAt,
+  }))])
+}
+
 async function failSend(storage, digest, record, detail, log, subject) {
   if (!record) return false
   const inflight = await storage.readInflight(digest)
@@ -480,6 +519,7 @@ async function ingest(response, context) {
         detail: { position: entry.position },
       })
       context.wake()
+      context.saved?.()
       entries = entries.slice(1)
       guard = 0
     } catch (error) {

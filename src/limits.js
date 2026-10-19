@@ -3,4 +3,6 @@ export const SYNC_LIMITS = {
   // Changes in one POST /sync. A batch's photos upload, then the batch is sent and the server starts
   // applying it while the next batch uploads, so data appears early and a stop loses one batch at most.
   sendBatch: 100,
+  // Entries in one ack. A client far behind (a new phone) catches up page by page, with progress.
+  receivePage: 200,
 }

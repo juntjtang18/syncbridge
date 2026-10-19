@@ -310,9 +310,16 @@ async function handlePost(req, storage, callbacks, currentSubject, wake, log) {
   const delivery = clientId
     ? deliveryFor(storage, subject, pointer, clientId)
     : { skipped: [], entries: storage.entriesAfter(subject, pointer).map(publicEntry) }
+  // A client that asks for pages (`receivePage`) gets at most that many entries, with `more` when
+  // others follow; a skip past the page's end waits for the page that reaches it.
+  const page = Number.isInteger(body.receivePage) && body.receivePage > 0 ? body.receivePage : null
+  const remaining = delivery.entries.length
+  const entries = page && remaining > page ? delivery.entries.slice(0, page) : delivery.entries
+  const more = entries.length < remaining
+  const reached = more ? entries[entries.length - 1].position : Infinity
   const seen = new Set(skipped.map((item) => item.id))
   for (const item of delivery.skipped) {
-    if (!seen.has(item.id)) skipped.push(item)
+    if (!seen.has(item.id) && item.position <= reached) skipped.push(item)
   }
   if (enqueued) wake()
 
@@ -331,8 +338,10 @@ async function handlePost(req, storage, callbacks, currentSubject, wake, log) {
     body: {
       ...emptyAck(failure ? (acceptedIds.length > 0 ? "partial" : "failed") : "succeed", subject),
       acceptedIds,
-      entries: delivery.entries,
+      entries,
       skipped,
+      ...(page ? { more, remaining, applying: storage.unprocessedCount(subject) } : {}),
+      ...(clientId ? { serverFailed: storage.applyFailuresFor(subject, clientId) } : {}),
       ...(failure ? { error: failure.message } : {}),
     },
   }
