@@ -1,13 +1,11 @@
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import Database from "better-sqlite3"
 import assert from "node:assert/strict"
 import test from "node:test"
 import { randomId, sha256, subjectDigest } from "../src/contracts.js"
 import { createHttpTransport } from "../src/http-transport.js"
 import { createNodeClientStorage } from "../src/node-client-storage.js"
-import { createNodeServerStorage } from "../src/node-server-storage.js"
 import { createClient } from "../src/sync-client.js"
 import { createSyncServer } from "../src/node.js"
 import { assertNoServerStaging, createHostStore } from "../testing/host.js"
@@ -37,13 +35,12 @@ async function setup(t, files = []) {
 // A client whose transport counts each call; `put` may be made to fail.
 function countingClient(dataDir, url, store, { failPut, sendBatch } = {}) {
   const real = createHttpTransport({ url })
-  const calls = { post: [], put: 0, has: 0 }
+  const calls = { post: [], put: 0 }
   const client = createClient({
     storage: createNodeClientStorage(dataDir),
     transport: {
       post(body) { calls.post.push(body.changes.length); return real.post(body) },
       async put(body) { calls.put += 1; if (failPut?.(calls.put)) throw new Error("network dropped"); return real.put(body) },
-      has(hash) { calls.has += 1; return real.has(hash) },
       get: (hash) => real.get(hash),
     },
     sha256,
@@ -88,56 +85,6 @@ test("a stop part way through the uploads re-uploads nothing already sent", asyn
   assert.equal(second.calls.put, 2)
   assert.deepEqual(applied, [0, 1, 2, 3])
   await assertNoServerStaging(path.join(root, "server"))
-})
-
-test("bytes the server already holds are not uploaded again, and the change applies from the stored copy", async (t) => {
-  const photo = "the-same-photo"
-  const { root, store, applied, server, endpoints } = await setup(t, [["a.jpg", photo], ["b.jpg", photo]])
-  const a = countingClient(path.join(root, "a"), endpoints.url, store)
-  await a.use()
-  await a.client.appendChanges({ data: "from a", attachments: [{ id: "photo-a", path: "a.jpg", contentType: "image/jpeg" }] })
-  await a.client.sync()
-  await server.whenIdle()
-  assert.equal(a.calls.put, 1)
-
-  const b = countingClient(path.join(root, "b"), endpoints.url, store)
-  await b.use()
-  await b.client.appendChanges({ data: "from b", attachments: [{ id: "photo-b", path: "b.jpg", contentType: "image/jpeg" }] })
-  await b.client.sync()
-  await server.whenIdle()
-  assert.equal(b.calls.put, 0, "the server held those bytes")
-  assert.deepEqual(applied, ["from a", "from b"])
-  assert.equal(store.files.get("server/photo-b").toString(), photo)
-  await assertNoServerStaging(path.join(root, "server"))
-})
-
-test("HEAD /sync tells whether the host holds bytes", async (t) => {
-  const { root, store, server, endpoints } = await setup(t, [["a.jpg", "held-bytes"]])
-  const transport = createHttpTransport({ url: endpoints.url })
-  const hash = sha256(Buffer.from("held-bytes"))
-  assert.equal(await transport.has(hash), false)
-  const a = countingClient(path.join(root, "a"), endpoints.url, store)
-  await a.use()
-  await a.client.appendChanges({ data: "a", attachments: [{ id: "photo-a", path: "a.jpg", contentType: "image/jpeg" }] })
-  await a.client.sync()
-  await server.whenIdle()
-  assert.equal(await transport.has(hash), true)
-  assert.equal(await transport.has(sha256(Buffer.from("other"))), false)
-})
-
-test("an existing log is indexed by its attachments when the server storage opens", async (t) => {
-  const root = await mkdtemp(path.join(tmpdir(), "syncbridge-index-"))
-  t.after(() => rm(root, { recursive: true, force: true }))
-  const hash = sha256(Buffer.from("x"))
-  const first = createNodeServerStorage(root)
-  first.appendEntry(subject, "e1", { data: 1, attachments: [{ id: "p", path: "server/p", sha256: hash, size: 1 }] })
-  first.close()
-  const db = new Database(path.join(root, "syncbridge.sqlite"))
-  db.exec("DROP TABLE log_attachments")
-  db.close()
-  const reopened = createNodeServerStorage(root)
-  t.after(() => reopened.close())
-  assert.deepEqual(reopened.findAttachment(subject, hash), { id: "p", path: "server/p", sha256: hash, size: 1 })
 })
 
 test("a client far behind downloads in pages and reports its progress", async (t) => {
@@ -205,36 +152,4 @@ test("a change the server cannot apply shows in the sender's failed entries", as
   assert.match(failed[0].error, /apply failed after 3 attempts: drive refused/)
   await sender.client.sync()
   assert.equal((await sender.client.failedEntries()).length, 1, "reported once")
-})
-
-test("a batch on a slow network is sent with the changes whose photos are up", async (t) => {
-  const files = Array.from({ length: 6 }, (_, index) => [`p${index}.jpg`, `slow-${index}`])
-  const { root, store, applied, server, endpoints } = await setup(t, files)
-  const real = createHttpTransport({ url: endpoints.url })
-  const posts = []
-  const client = createClient({
-    storage: createNodeClientStorage(path.join(root, "client")),
-    transport: {
-      post(body) { posts.push(body.changes.length); return real.post(body) },
-      async put(body) { await new Promise((resolve) => setTimeout(resolve, 40)); return real.put(body) },
-      has: () => false,
-      get: (hash) => real.get(hash),
-    },
-    sha256,
-    randomId,
-    sendSeconds: 0.06,
-  })
-  await client.use(subject, async () => {}, { readAttachment: store.readAttachment })
-  for (let index = 0; index < 6; index += 1) {
-    await client.appendChanges({ data: index, attachments: [{ id: `photo-${index}`, path: `p${index}.jpg`, contentType: "image/jpeg" }] })
-  }
-  const uploaded = []
-  client.onProgress((progress) => uploaded.push(progress.uploaded))
-  await client.sync()
-  await server.whenIdle()
-  assert.ok(posts.length >= 3, `posted in ${posts.join("/")}`)
-  assert.ok(posts.every((size) => size >= 1 && size <= 2), `posted in ${posts.join("/")}`)
-  assert.equal(posts.reduce((sum, size) => sum + size, 0), 6)
-  assert.deepEqual(applied, [0, 1, 2, 3, 4, 5])
-  assert.ok(uploaded.includes(1) && uploaded.includes(6), "progress moves photo by photo")
 })

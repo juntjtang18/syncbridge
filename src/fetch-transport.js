@@ -42,16 +42,6 @@ export function createFetchTransport({ url, headers, fetch }) {
       return parsed
     },
 
-    // Whether the server already holds these bytes (HEAD /sync?sha256=). Unsure means no: upload.
-    async has(hash) {
-      try {
-        const response = await request(withHash(url, hash), { method: "HEAD", credentials: "include", headers: await requestHeaders(headers) })
-        return response.status === 200
-      } catch {
-        return false
-      }
-    },
-
     async get(hash, dest) {
       const response = await request(withHash(url, hash), {
         method: "GET",

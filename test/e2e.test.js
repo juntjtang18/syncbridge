@@ -700,7 +700,7 @@ test("e2e: two waiting changes with the same bytes both apply, then staging is d
   await assertNoClientStaging(receiverDir)
 })
 
-test("e2e: an upload whose staging another client's apply deleted reads the stored copy", async (t) => {
+test("e2e: an upload whose staging another client's apply deleted is uploaded again", async (t) => {
   const dirs = await tempDirs(t)
   const photo = Buffer.from("shared-photo")
   const store = createHostStore([["a.jpg", photo], ["b.jpg", photo]])
@@ -741,8 +741,13 @@ test("e2e: an upload whose staging another client's apply deleted reads the stor
     await server.whenIdle()
     await assertNoServerStaging(dirs.server)
   }
-  await clientB.sync()
+  const refused = await clientB.sync()
+  assert.equal(refused.status, "failed")
+  assert.match(refused.error, /ATTACHMENT_NOT_FOUND/)
+  // The next sync uploads the bytes again, and the change applies.
+  const retried = await clientB.sync()
   await server.whenIdle()
+  assert.equal(retried.status, "succeed")
   assert.deepEqual(applied, [["photo-a", "shared-photo"], ["photo-b", "shared-photo"]])
   await assertNoServerStaging(dirs.server)
 })

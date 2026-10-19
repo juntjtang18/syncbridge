@@ -62,7 +62,7 @@ export function createServer({ storage, currentSubject, log }) {
       const origin = storage.entryOrigin(row.subject, row.id)
       const applied = await registered.applyChange(
         { id: row.id, position: row.position, package: row.package, clientId: origin.clientId, base: origin.base },
-        readerFor(storage, row.package.attachments, row.subject, registered.readAttachment),
+        readerFor(storage, row.package.attachments),
       )
       if (applied?.attachments) storage.updateAttachmentPaths(row.subject, row.id, applied.attachments)
       storage.removeUnprocessed(row.subject, row.id)
@@ -228,11 +228,7 @@ async function dispatch(req, res, storage, callbacks, currentSubject, wake, log)
     await handleGet(req, res, storage, callbacks, currentSubject, query, log)
     return
   }
-  if (req.method === "HEAD") {
-    await handleHead(res, storage, currentSubject, req, query)
-    return
-  }
-  res.writeHead(405, { Allow: "GET, HEAD, POST, PUT" })
+  res.writeHead(405, { Allow: "GET, POST, PUT" })
   res.end()
 }
 
@@ -355,9 +351,6 @@ function acceptChange(storage, subject, change, clientId, base) {
   const packageValue = persistedPackage(change.package)
   if (storage.hasEntry(subject, change.id)) return { id: change.id, enqueued: false }
   for (const manifest of packageValue.attachments) {
-    // Staging gone, but the host already stores these bytes for an earlier change: apply reads that copy.
-    const stored = !storage.openBlob(manifest.sha256) && storage.findAttachment(subject, manifest.sha256)
-    if (stored && stored.size === manifest.size) continue
     try {
       storage.requireBlob(manifest.sha256, manifest.size)
     } catch (error) {
@@ -432,16 +425,6 @@ function publicEntry(row) {
 
 function changesOf(body) {
   return Array.isArray(body.changes) ? body.changes : []
-}
-
-// HEAD /sync?sha256=: 200 when the host already holds these bytes, as a PUT staging or as the stored
-// copy of an applied change in the live subject's log, so a client need not upload them again.
-async function handleHead(res, storage, currentSubject, req, query) {
-  const hash = requireSha256(query)
-  let held = Boolean(storage.openBlob(hash))
-  if (!held && currentSubject !== undefined) held = Boolean(storage.findAttachment(requireSubject(await currentSubject(req)), hash))
-  res.writeHead(held ? 200 : 404)
-  res.end()
 }
 
 async function handleGet(req, res, storage, callbacks, currentSubject, query, log) {
@@ -636,14 +619,6 @@ function writeAckError(res, error) {
   })
 }
 
-// Reads an upload's PUT staging. When the staging is gone (another change with the same bytes was
-// applied first and it was deleted, as when two clients upload one photo), the same bytes are read
-// from the host's stored copy, found through the log by hash, as GET /sync does.
-function readerFor(storage, manifests, subject, readAttachment) {
-  return createAttachmentReader(manifests, async (manifest) => {
-    if (storage.openBlob(manifest.sha256)) return storage.readBlob(manifest.sha256)
-    const stored = storage.findAttachment(subject, manifest.sha256)
-    if (!stored || !readAttachment) throw attachmentError("ATTACHMENT_NOT_FOUND", `ATTACHMENT_NOT_FOUND sha256 ${manifest.sha256}`)
-    return asBytes(await readAttachment(stored), "attachment")
-  }, sha256)
+function readerFor(storage, manifests) {
+  return createAttachmentReader(manifests, async (manifest) => storage.readBlob(manifest.sha256))
 }

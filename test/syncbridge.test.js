@@ -154,7 +154,7 @@ test("two clients sync one subject through the server log", async (t) => {
 
   const db = new Database(path.join(dirs.server, "syncbridge.sqlite"), { readonly: true })
   const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all()
-  assert.deepEqual(tables.map((row) => row.name).sort(), ["failed_entries", "log_attachments", "log_entries", "send_attempts", "subject_counters", "unprocessed"])
+  assert.deepEqual(tables.map((row) => row.name).sort(), ["failed_entries", "log_entries", "send_attempts", "subject_counters", "unprocessed"])
   db.close()
 })
 
