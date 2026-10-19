@@ -57,7 +57,7 @@ export function createNodeServerStorage(dataDir) {
     between: db.prepare("SELECT id, position, package_json, client_id FROM log_entries WHERE subject = ? AND position > ? AND position < ? ORDER BY position"),
     setPackage: db.prepare("UPDATE log_entries SET package_json = ? WHERE subject = ? AND id = ?"),
     enqueue: db.prepare("INSERT OR IGNORE INTO unprocessed (subject, position, id, package_json) VALUES (?, ?, ?, ?)"),
-    head: db.prepare("SELECT subject, position, id, package_json FROM unprocessed ORDER BY seq LIMIT ?"),
+    head: db.prepare("SELECT subject, position, id, package_json FROM unprocessed WHERE subject = ? ORDER BY seq LIMIT ?"),
     dequeue: db.prepare("DELETE FROM unprocessed WHERE subject = ? AND id = ?"),
     waiting: db.prepare("SELECT count(*) AS n FROM unprocessed"),
     pending: db.prepare("SELECT DISTINCT subject FROM unprocessed ORDER BY subject"),
@@ -96,7 +96,8 @@ export function createNodeServerStorage(dataDir) {
     },
 
     enqueue: (subject, position, id, packageValue) => q.enqueue.run(subject, position, id, JSON.stringify(packageValue)),
-    unprocessedHead: (limit) => q.head.all(limit).map((found) => ({ ...row(found), subject: found.subject })),
+    // One subject's oldest waiting changes, in the order they were logged.
+    unprocessedHead: (subject, limit) => q.head.all(subject, limit).map((found) => ({ ...row(found), subject: found.subject })),
     dequeue: (subject, id) => q.dequeue.run(subject, id),
     hasUnprocessed: () => q.waiting.get().n > 0,
     pendingSubjects: () => q.pending.all().map((found) => found.subject),

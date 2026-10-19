@@ -63,9 +63,10 @@ log, in the same order. Applications apply each change; the last one logged wins
     - `GET ?subject=&entry=&attachment=` → one attachment of one logged change: its upload while the
       change waits to be applied, then the host's stored copy through `readAttachment`.
     - Any other error is a non-2xx `{ error }`. Requests are not serialized.
-15. Accepted changes are applied through `applyChange(entry, attachments)`, up to `applyConcurrency`
-    (3) at once: the same `applyKey(entry)` one at a time in log order, different keys side by side,
-    no key alone (it waits for everything before it). An apply is tried 3 times; after the third
+15. Accepted changes are applied through `applyChange(entry, attachments)`. Each subject is scheduled
+    on its own, so one subject's backlog never holds up another's: up to `applyConcurrency` (3) of a
+    subject's changes at once, the same `applyKey(entry)` one at a time in log order, different keys
+    side by side, no key alone (it waits for that subject's changes before it). An apply is tried 3 times; after the third
     failure it goes on the server's failure list. Either way its uploads are deleted. `applyChange`
     may return `{ attachments: [{ id, path }] }` to point later downloads at the stored copy.
 16. `appendChanges(subject, { data })` logs a host change for every client. With `{ apply: true }`

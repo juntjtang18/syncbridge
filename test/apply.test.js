@@ -76,3 +76,19 @@ test("a restarted server names the subjects with changes still waiting, and appl
   })
   await stored.close()
 })
+
+test("one user's backlog does not hold up another user's changes", async (t) => {
+  const root = await tempDir(t)
+  const server = createSyncServer({ dataDir: path.join(root, "two-users") })
+  t.after(() => server.close())
+  const done = []
+  const slow = (name) => async (entry) => { await new Promise((resolve) => setTimeout(resolve, 30)); done.push(`${name}:${entry.package.data}`) }
+  server.init("user.4", slow("user.4"))
+  server.init("user.5", slow("user.5"))
+  // user.4 logs ten changes without a key (each waits for the one before), then user.5 logs one.
+  const backlog = Array.from({ length: 10 }, (_, index) => server.appendChanges("user.4", { data: index }, { apply: true }))
+  await server.appendChanges("user.5", { data: "web edit" }, { apply: true })
+  assert.ok(done.indexOf("user.5:web edit") < 3, `user.5 applied after ${done.indexOf("user.5:web edit")} of user.4's changes`)
+  await Promise.all(backlog)
+  assert.deepEqual(done.filter((item) => item.startsWith("user.4")), Array.from({ length: 10 }, (_, index) => `user.4:${index}`))
+})

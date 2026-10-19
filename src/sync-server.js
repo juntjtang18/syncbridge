@@ -13,9 +13,10 @@ const APPLY_WINDOW = 200
 //   PUT   bytes → { upload, sha256, size }: one upload, kept until its change is applied
 //   POST  { subject, pointer, clientId, changes, page } → { acceptedIds, refused?, entries, more, remaining }
 //   GET   ?subject=&entry=&attachment= → one attachment of one logged change
-// Accepted changes are applied through the host's applyChange, up to `applyConcurrency` at once:
-// the same applyKey one at a time in log order, different keys side by side, no key alone. An apply
-// that fails three times goes on the failure list.
+// Accepted changes are applied through the host's applyChange. Each subject is scheduled on its own,
+// so one user's backlog never holds up another's: up to `applyConcurrency` of a subject's changes at
+// once, the same applyKey one at a time in log order, different keys side by side, no key alone
+// (within that subject). An apply that fails three times goes on the failure list.
 export function createServer({ storage, currentSubject, log, applyConcurrency = SYNC_LIMITS.applyConcurrency }) {
   const callbacks = new Map()
   const waiting = new Map()
@@ -30,13 +31,19 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
   async function pump() {
     const running = new Map()
     while (!stopped) {
-      for (const row of startable(storage.unprocessedHead(APPLY_WINDOW), running)) {
-        running.set(row.id, { key: keyOf(row), done: applyRow(row).finally(() => running.delete(row.id)) })
+      for (const subject of storage.pendingSubjects()) {
+        if (!callbacks.has(subject)) continue
+        const mine = running.get(subject) ?? new Map()
+        for (const row of startable(storage.unprocessedHead(subject, APPLY_WINDOW), mine)) {
+          mine.set(row.id, { key: keyOf(row), done: applyRow(row).finally(() => mine.delete(row.id)) })
+        }
+        running.set(subject, mine)
       }
-      if (running.size === 0) return
-      await Promise.race([...running.values()].map((item) => item.done))
+      const all = [...running.values()].flatMap((mine) => [...mine.values()])
+      if (all.length === 0) return
+      await Promise.race(all.map((item) => item.done))
     }
-    await Promise.allSettled([...running.values()].map((item) => item.done))
+    await Promise.allSettled([...running.values()].flatMap((mine) => [...mine.values()].map((item) => item.done)))
   }
 
   function keyOf(row) {
@@ -44,14 +51,14 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
     return typeof key === "string" && key ? `${row.subject}\n${key}` : null
   }
 
-  // Oldest first: a keyed row no earlier row holds the key of, or a keyless row with nothing before
-  // it. Nothing passes a keyless row. A subject not initialized yet waits for its init.
+  // One subject's rows to start now, oldest first: a keyed row no earlier row holds the key of, or a
+  // keyless row with nothing before it. Nothing passes a keyless row.
   function startable(rows, running) {
     const chosen = []
     const held = new Set([...running.values()].map((item) => item.key))
     for (const row of rows) {
       if (running.size + chosen.length >= applyConcurrency) break
-      if (running.has(row.id) || !callbacks.has(row.subject)) continue
+      if (running.has(row.id)) continue
       const key = keyOf(row)
       if (key === null) {
         if (held.size === 0 && chosen.length === 0) chosen.push(row)
