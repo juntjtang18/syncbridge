@@ -14,7 +14,7 @@ export function createFetchTransport({ url, headers, fetch }) {
       })
       const text = await requireText(response)
       const parsed = text ? JSON.parse(text) : {}
-      return { sha256: parsed.sha256, size: parsed.size }
+      return { upload: parsed.upload, sha256: parsed.sha256, size: parsed.size }
     },
 
     async post(body) {
@@ -42,28 +42,24 @@ export function createFetchTransport({ url, headers, fetch }) {
       return parsed
     },
 
-    async get(hash, dest) {
-      const response = await request(withHash(url, hash), {
+    // One attachment of one logged change: GET /sync?subject=&entry=&attachment=.
+    async get(subject, entry, attachment) {
+      const response = await request(attachmentUrl(url, subject, entry, attachment), {
         method: "GET",
         credentials: "include",
         headers: await requestHeaders(headers),
       })
       if (!response.ok) throw await errorFrom(response)
-      if (dest && typeof dest.getWriter === "function") {
-        if (response.body == null || typeof response.body.pipeTo !== "function") {
-          throw new TypeError("fetch response does not expose a readable body stream")
-        }
-        await response.body.pipeTo(dest)
-        return
-      }
       return new Uint8Array(await response.arrayBuffer())
     },
   }
 }
 
-function withHash(url, hash) {
+function attachmentUrl(url, subject, entry, attachment) {
   const target = new URL(url)
-  target.searchParams.set("sha256", hash)
+  target.searchParams.set("subject", subject)
+  target.searchParams.set("entry", entry)
+  target.searchParams.set("attachment", attachment)
   return target.toString()
 }
 

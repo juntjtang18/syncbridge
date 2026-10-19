@@ -378,22 +378,24 @@ test("a bad change is refused twice and the third send moves it to the client fa
   assert.deepEqual(rows.map((row) => row.id), ["good"])
 })
 
-test("an attachment refusal names the reason, hash, size, and attachment id", async (t) => {
+test("an attachment refusal names the reason, upload, size, and attachment id", async (t) => {
   const dirs = await tempDirs(t)
   const hash = "ab".repeat(32)
+  const missingUpload = "00000000-0000-0000-0000-00000000000a"
+  const storedUpload = "00000000-0000-0000-0000-00000000000b"
   const storage = createNodeServerStorage(dirs.server)
   assert.throws(
-    () => storage.requireBlob(hash, 1),
-    (error) => error.code === "ATTACHMENT_NOT_FOUND" && error.message === `ATTACHMENT_NOT_FOUND sha256 ${hash}`,
+    () => storage.requireBlob(missingUpload, 1),
+    (error) => error.code === "ATTACHMENT_NOT_FOUND" && error.message === `ATTACHMENT_NOT_FOUND upload ${missingUpload}`,
   )
   await mkdir(path.join(dirs.server, "blobs"), { recursive: true })
   const stored = Buffer.from("abcd")
   const storedHash = digestBytes(stored)
-  await writeFile(path.join(dirs.server, "blobs", storedHash), stored)
+  await writeFile(path.join(dirs.server, "blobs", storedUpload), stored)
   assert.throws(
-    () => storage.requireBlob(storedHash, 9),
+    () => storage.requireBlob(storedUpload, 9),
     (error) => error.code === "ATTACHMENT_SIZE_MISMATCH"
-      && error.message === `ATTACHMENT_SIZE_MISMATCH sha256 ${storedHash} expected 9 actual 4`,
+      && error.message === `ATTACHMENT_SIZE_MISMATCH upload ${storedUpload} expected 9 actual 4`,
   )
   storage.close()
 
@@ -417,23 +419,16 @@ test("an attachment refusal names the reason, hash, size, and attachment id", as
     attempts: 0,
     package: {
       data: "missing",
-      attachments: [{ id: "photo-1", path: "photo-1.jpg", sha256: hash, size: 1 }],
+      attachments: [{ id: "photo-1", path: "photo-1.jpg", sha256: hash, size: 1, upload: missingUpload }],
     },
   }])
   const missing = await client.sync()
   assert.equal(missing.status, "failed")
-  const missingText = `ATTACHMENT_NOT_FOUND sha256 ${hash} attachment photo-1`
-  // A lost upload is sent again in the same sync; with no way to read the file here, that fails.
-  assert.equal(missing.error, "readAttachment is required")
+  const missingText = `ATTACHMENT_NOT_FOUND upload ${missingUpload} attachment photo-1`
+  assert.equal(missing.error, missingText)
   assert.equal(serverLog.find((event) => event.step === "ack").error, missingText)
   assert.equal(clientLog.find((event) => event.step === "ack").error, missingText)
 
-  const uploaded = await fetch(endpoints.url, {
-    method: "PUT",
-    headers: { "content-type": "application/octet-stream" },
-    body: stored,
-  })
-  assert.equal(uploaded.status, 200)
   serverLog.length = 0
   clientLog.length = 0
   await client.setOutbox([{
@@ -441,11 +436,11 @@ test("an attachment refusal names the reason, hash, size, and attachment id", as
     attempts: 0,
     package: {
       data: "wrong-size",
-      attachments: [{ id: "photo-1", path: "photo-1.jpg", sha256: storedHash, size: 9 }],
+      attachments: [{ id: "photo-1", path: "photo-1.jpg", sha256: storedHash, size: 9, upload: storedUpload }],
     },
   }])
   const mismatched = await client.sync()
-  const mismatchText = `ATTACHMENT_SIZE_MISMATCH sha256 ${storedHash} expected 9 actual 4 attachment photo-1`
+  const mismatchText = `ATTACHMENT_SIZE_MISMATCH upload ${storedUpload} expected 9 actual 4 attachment photo-1`
   assert.equal(mismatched.status, "failed")
   assert.equal(mismatched.error, mismatchText)
   assert.equal(serverLog.find((event) => event.step === "ack").error, mismatchText)
@@ -475,7 +470,7 @@ test("a disk error while checking an attachment keeps its own message", async (t
     attempts: 0,
     package: {
       data: "disk",
-      attachments: [{ id: "photo-1", path: "photo-1.jpg", sha256: "ab".repeat(32), size: 1 }],
+      attachments: [{ id: "photo-1", path: "photo-1.jpg", sha256: "ab".repeat(32), size: 1, upload: "00000000-0000-0000-0000-00000000000c" }],
     },
   }])
   const failed = await client.sync()

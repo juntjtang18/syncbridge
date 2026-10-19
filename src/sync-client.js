@@ -9,8 +9,6 @@ import { SYNC_LIMITS } from "./limits.js"
 import { createLog, trace } from "./log.js"
 
 const ATTEMPT_LIMIT = 3
-// Uploads the server lost, sent again within one sync() before it reports a failure.
-const REUPLOAD_LIMIT = 3
 
 export function createClient({ storage, transport, sha256, randomId, log, sendBatch = SYNC_LIMITS.sendBatch, receivePage = SYNC_LIMITS.receivePage }) {
   if (typeof sha256 !== "function") throw new TypeError("sha256 must be a function")
@@ -78,7 +76,7 @@ export function createClient({ storage, transport, sha256, randomId, log, sendBa
       const applied = await callback(
         { id: row.id, position: row.position, package: row.package, ...(row.own ? { own: true } : {}) },
         createAttachmentReader(row.package.attachments || [], async (manifest) => {
-          return storage.readBlob(targetDigest, manifest.sha256)
+          return storage.readBlob(targetDigest, stagedName(row, manifest))
         }, sha256),
       )
       if (applied?.attachments) {
@@ -94,16 +92,8 @@ export function createClient({ storage, transport, sha256, randomId, log, sendBa
           await storage.writeUnprocessed(targetDigest, rows)
         })
       }
-      // Staging is stored by content: keep it while a change still waiting carries the same bytes.
-      // Under the queue lock, as saveReceived stages and enqueues, so none slips between the two.
-      await withQueue(async () => {
-        const rows = (await storage.readUnprocessed(targetDigest)).filter((item) => item.id !== row.id)
-        await storage.writeUnprocessed(targetDigest, rows)
-        const waiting = new Set(rows.flatMap((item) => (item.package.attachments || []).map((manifest) => manifest.sha256)))
-        for (const manifest of row.package.attachments || []) {
-          if (manifest.sha256 && !waiting.has(manifest.sha256)) await storage.dropBlob(targetDigest, manifest.sha256)
-        }
-      })
+      await removeUnprocessed(targetDigest, row.id)
+      for (const manifest of row.package.attachments || []) await storage.dropBlob(targetDigest, stagedName(row, manifest))
       trace(sink, { side: "client", subject: loggedSubject, step: "applied", id: row.id, attempt })
     } catch (error) {
       const attempts = (row.attempts || 0) + 1
@@ -257,7 +247,6 @@ export function createClient({ storage, transport, sha256, randomId, log, sendBa
         const clientId = await storage.ensureClientId()
         let pulled = false
         let more = false
-        let reuploads = 0
         report({ sent: 0, uploaded: 0, toSend: (await storage.readOutbox(digest)).length, received: 0, toReceive: 0, applying: 0 })
         for (;;) {
           const inflight = await storage.claimInflight(digest)
@@ -355,14 +344,6 @@ export function createClient({ storage, transport, sha256, randomId, log, sendBa
               if (left.length === 0 && !more) return { status: "succeed", subject }
               return { status: response.status, subject, error: response.error }
             }
-            // The server lost the upload (another change with the same bytes was applied and its
-            // staging deleted). Not the change's fault: forget its hashes and upload again now,
-            // without using an attempt, a few times per sync.
-            if (/ATTACHMENT_NOT_FOUND/.test(response.error || "") && reuploads < REUPLOAD_LIMIT) {
-              reuploads += 1
-              await storage.writeInflight(digest, forgetHashes(rejected))
-              continue
-            }
             const capped = await failSend(storage, digest, rejected, response.error || response.status, sink, subject)
             if (!capped) return { status: response.status, subject, error: response.error }
             continue
@@ -454,14 +435,17 @@ function queuePackage(value) {
       const manifest = { id: attachment.id, path: attachment.path }
       if (attachment.contentType !== undefined) manifest.contentType = attachment.contentType
       if (attachment.sha256 !== undefined) manifest.sha256 = attachment.sha256
+      if (attachment.upload !== undefined) manifest.upload = attachment.upload
       if (attachment.size !== undefined) manifest.size = attachment.size
       return manifest
     }),
   }
 }
 
-function forgetHashes(row) {
-  return { ...row, package: { ...row.package, attachments: row.package.attachments.map(({ sha256, size, ...manifest }) => manifest) } }
+// A received change's attachment, saved under the change's id and the attachment's place in it:
+// each change has its own copy, so applying one never touches another's.
+function stagedName(entry, manifest) {
+  return `${entry.id}.${entry.package.attachments.indexOf(manifest)}`
 }
 
 // The oldest rows, at most `limit`. A row that failed before goes last: nothing after it is sent.
@@ -583,14 +567,11 @@ async function ingest(response, context) {
 
 async function saveReceived(context, entry) {
   const attachments = entry.package?.attachments || []
-  const downloaded = []
   for (const manifest of attachments) {
-    if (!manifest?.sha256) throw new Error(`attachment for ${manifest?.id || "unknown"} is missing`)
-    downloaded.push([manifest.sha256, await context.transport.get(manifest.sha256)])
+    const bytes = await context.transport.get(context.subject, entry.id, manifest.id)
+    await context.storage.putBlob(context.digest, stagedName(entry, manifest), manifest.sha256, bytes)
   }
   await context.withQueue(async () => {
-    // Staged and enqueued together: an apply of the same bytes cannot delete the staging between.
-    for (const [hash, bytes] of downloaded) await context.storage.putBlob(context.digest, hash, bytes)
     const rows = await context.storage.readUnprocessed(context.digest)
     if (rows.some((row) => row.id === entry.id)) return
     rows.push({ id: entry.id, position: entry.position, package: entry.package, attempts: 0, ...(entry.own ? { own: true } : {}) })
@@ -646,7 +627,7 @@ async function fillHashes(changes, readAttachment, transport, log, subject, save
   for (const change of changes) {
     let changed = false
     for (const manifest of change.package.attachments) {
-      if (manifest.sha256 && Number.isInteger(manifest.size)) continue
+      if (manifest.upload) continue
       if (!readAttachment) throw new Error("readAttachment is required")
       trace(log, {
         side: "client",
@@ -659,9 +640,10 @@ async function fillHashes(changes, readAttachment, transport, log, subject, save
       if (uploaded?.status === "failed" || uploaded?.status === "error") {
         throw new Error(uploaded.error || "attachment upload failed")
       }
-      if (!uploaded || !/^[0-9a-f]{64}$/.test(uploaded.sha256) || !Number.isInteger(uploaded.size)) {
+      if (!uploaded || typeof uploaded.upload !== "string" || !/^[0-9a-f]{64}$/.test(uploaded.sha256) || !Number.isInteger(uploaded.size)) {
         throw new TypeError("put response is invalid")
       }
+      manifest.upload = uploaded.upload
       manifest.sha256 = uploaded.sha256
       manifest.size = uploaded.size
       changed = true
@@ -671,7 +653,7 @@ async function fillHashes(changes, readAttachment, transport, log, subject, save
         step: "put",
         id: change.id,
         status: "succeed",
-        detail: { attachmentId: manifest.id, sha256: uploaded.sha256, size: uploaded.size },
+        detail: { attachmentId: manifest.id, upload: uploaded.upload, sha256: uploaded.sha256, size: uploaded.size },
       })
     }
     if (changed) await saved(change)

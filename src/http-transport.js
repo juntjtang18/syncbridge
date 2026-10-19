@@ -17,7 +17,7 @@ export function createHttpTransport({ url, headers }) {
       })
       if (status < 200 || status >= 300) throw errorFrom(Buffer.from(text || ""))
       const parsed = text ? JSON.parse(text) : {}
-      return { sha256: parsed.sha256, size: parsed.size }
+      return { upload: parsed.upload, sha256: parsed.sha256, size: parsed.size }
     },
 
     async post(body) {
@@ -38,16 +38,9 @@ export function createHttpTransport({ url, headers }) {
       return parsed
     },
 
-    async get(hash, filePath) {
-      const body = await send({
-        url: withHash(url, hash),
-        method: "GET",
-        headers: await requestHeaders(headers),
-        writeTo: filePath,
-        binary: !filePath,
-      })
-      if (filePath) return undefined
-      return body
+    // One attachment of one logged change: GET /sync?subject=&entry=&attachment=.
+    async get(subject, entry, attachment) {
+      return send({ url: attachmentUrl(url, subject, entry, attachment), method: "GET", headers: await requestHeaders(headers), binary: true })
     },
   }
 }
@@ -57,9 +50,11 @@ function putBody(body) {
   return body
 }
 
-function withHash(url, hash) {
+function attachmentUrl(url, subject, entry, attachment) {
   const target = new URL(url)
-  target.searchParams.set("sha256", hash)
+  target.searchParams.set("subject", subject)
+  target.searchParams.set("entry", entry)
+  target.searchParams.set("attachment", attachment)
   return target
 }
 

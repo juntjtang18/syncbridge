@@ -225,7 +225,7 @@ test("e2e: a sender keeps a refused change for two acks and records it after the
       attempts: 0,
       package: {
         data: "refused",
-        attachments: [{ id: "a", path: "a.jpg", sha256: "ab".repeat(32), size: 1 }],
+        attachments: [{ id: "a", path: "a.jpg", sha256: "ab".repeat(32), size: 1, upload: "00000000-0000-0000-0000-00000000000a" }],
       },
     },
     {
@@ -700,7 +700,7 @@ test("e2e: two waiting changes with the same bytes both apply, then staging is d
   await assertNoClientStaging(receiverDir)
 })
 
-test("e2e: an upload whose staging another client's apply deleted is uploaded again", async (t) => {
+test("e2e: two clients uploading the same bytes each keep their own upload", async (t) => {
   const dirs = await tempDirs(t)
   const photo = Buffer.from("shared-photo")
   const store = createHostStore([["a.jpg", photo], ["b.jpg", photo]])
@@ -716,7 +716,7 @@ test("e2e: an upload whose staging another client's apply deleted is uploaded ag
   }, { readAttachment: store.readAttachment })
 
   // Client B uploads its photo, and before B sends its change, client A's change with the same
-  // bytes is applied, which deletes the shared staging.
+  // bytes is applied: A's upload is deleted, and B's own upload is untouched.
   const real = createHttpTransport({ url: endpoints.url })
   let beforePost = async () => {}
   const clientB = createClient({
@@ -739,7 +739,6 @@ test("e2e: an upload whose staging another client's apply deleted is uploaded ag
     beforePost = async () => {}
     await clientA.sync()
     await server.whenIdle()
-    await assertNoServerStaging(dirs.server)
   }
   // The server lost B's upload; the same sync uploads it again, without using an attempt.
   const result = await clientB.sync()
@@ -748,4 +747,25 @@ test("e2e: an upload whose staging another client's apply deleted is uploaded ag
   assert.deepEqual(await clientB.failedEntries(), [])
   assert.deepEqual(applied, [["photo-a", "shared-photo"], ["photo-b", "shared-photo"]])
   await assertNoServerStaging(dirs.server)
+})
+
+test("e2e: a change logged before uploads had ids is served from the host's stored copy", async (t) => {
+  const dirs = await tempDirs(t)
+  const photo = Buffer.from("old-photo")
+  const store = createHostStore([["server/old.jpg", photo]])
+  const server = createSyncServer({ dataDir: dirs.server, currentSubject() { return subjectA } })
+  t.after(() => server.close())
+  const endpoints = await listen(server, t)
+  server.init(subjectA, async () => {}, { readAttachment: store.readAttachment })
+  const db = new Database(path.join(dirs.server, "syncbridge.sqlite"))
+  db.prepare("INSERT INTO log_entries (subject, position, id, package_json) VALUES (?, 1, 'old', ?)")
+    .run(subjectA, JSON.stringify({ data: "old", attachments: [{ id: "p", path: "server/old.jpg", sha256: sha256(photo), size: photo.length }] }))
+  db.prepare("INSERT INTO subject_counters (subject, next_position) VALUES (?, 2)").run(subjectA)
+  db.close()
+  const received = []
+  const client = createSyncClient({ dataDir: dirs.client, url: endpoints.url })
+  await client.use(subjectA, async (entry, attachments) => { received.push(Buffer.from(await attachments.get("p").read()).toString()) }, { readAttachment: store.readAttachment })
+  await client.sync()
+  await client.whenIdle()
+  assert.deepEqual(received, ["old-photo"])
 })

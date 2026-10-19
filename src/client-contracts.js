@@ -98,6 +98,7 @@ export function persistedPackage(value) {
       throw new TypeError("attachment.path must be a non-empty string")
     }
     if (!/^[0-9a-f]{64}$/.test(attachment.sha256)) throw new TypeError("attachment.sha256 is invalid")
+    if (typeof attachment.upload !== "string" || attachment.upload.length === 0) throw new TypeError("attachment.upload is required")
     if (!Number.isInteger(attachment.size) || attachment.size < 0) {
       throw new TypeError("attachment.size must be a non-negative integer")
     }
@@ -164,6 +165,7 @@ function loggedManifest(attachment) {
     path: attachment.path,
     sha256: attachment.sha256,
     size: attachment.size,
+    upload: attachment.upload,
   }
   if (attachment.contentType !== undefined) {
     if (typeof attachment.contentType !== "string") throw new TypeError("contentType must be a string")

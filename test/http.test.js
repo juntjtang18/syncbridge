@@ -56,6 +56,7 @@ test("handle stages a stream and applies the posted change on any host path", as
             id: "photo-1",
             sha256: photoHash,
             size: photo.length,
+            upload: "00000000-0000-0000-0000-000000000001",
             contentType: "image/jpeg",
             path: "poi-1.jpg",
           }],
@@ -74,29 +75,19 @@ test("handle stages a stream and applies the posted change on any host path", as
   })
   assert.equal(applies, 1)
 
-  const downloaded = await fetch(`${endpoints.also}?sha256=${photoHash}`)
-  assert.equal(downloaded.status, 404)
-
+  // Each PUT is its own upload: the same bytes twice are two uploads, two files.
   const extra = Buffer.from("from-the-other-path")
-  const extraHash = sha256(extra)
-  const uploaded = await fetch(endpoints.also, {
+  const put = () => fetch(endpoints.also, {
     method: "PUT",
     headers: { "content-type": "application/octet-stream", "content-length": String(extra.length) },
     body: extra,
-  })
-  assert.equal(uploaded.status, 200)
-  assert.deepEqual(await uploaded.json(), { sha256: extraHash, size: extra.length })
-  const fromSync = await fetch(`${endpoints.url}?sha256=${extraHash}`)
-  assert.deepEqual(Buffer.from(await fromSync.arrayBuffer()), extra)
-
-  const second = await fetch(endpoints.url, {
-    method: "PUT",
-    headers: { "content-type": "application/octet-stream" },
-    body: Buffer.from("nope"),
-  })
-  assert.equal(second.status, 200)
-  const kept = await fetch(`${endpoints.also}?sha256=${extraHash}`)
-  assert.deepEqual(Buffer.from(await kept.arrayBuffer()), extra)
+  }).then((response) => response.json())
+  const first = await put()
+  const second = await put()
+  assert.equal(first.sha256, sha256(extra))
+  assert.equal(first.size, extra.length)
+  assert.notEqual(first.upload, second.upload)
+  assert.deepEqual((await readdir(path.join(dirs.server, "blobs"))).sort(), [first.upload, second.upload].sort())
   const temps = await readdir(path.join(dirs.server, "tmp"))
   assert.deepEqual(temps, [])
 })

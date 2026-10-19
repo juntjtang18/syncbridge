@@ -1,5 +1,7 @@
 # A1-2 — Attachment pointer (no durable blob store)
 
+**2026-10-19:** staging is per upload, not by content. `PUT /sync` saves each upload under its own `upload` id and returns `{ upload, sha256, size }`; the manifest carries `upload`, and `sha256` only checks the bytes. A receiver asks `GET /sync?subject=&entry=&attachment=` for one attachment of one logged change, and keeps it under that change's id until applied. No two changes share a file, so deleting one after its apply never affects another. Where this document says `GET /sync?sha256=` or a PUT temp shared by hash, read it as this.
+
 **Status:** implemented · 2026-10-07  
 **Amends:** [A1](./A1-syncbridge-highlevel-design.md) · **Requirements:** [A0](./A0-syncbridge-requirements.md)  
 **Also:** [A1-1](./A1-1-syncbridge-changing-subject.md)

@@ -105,10 +105,7 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
       )
       if (applied?.attachments) storage.updateAttachmentPaths(row.subject, row.id, applied.attachments)
       storage.removeUnprocessed(row.subject, row.id)
-      // PUT staging is stored by content: keep it while another waiting change carries the same bytes.
-      for (const manifest of row.package.attachments || []) {
-        if (manifest.sha256 && !storage.unprocessedUsesBlob(manifest.sha256)) storage.dropBlob(manifest.sha256)
-      }
+      for (const manifest of row.package.attachments) storage.dropBlob(manifest.upload)
       trace(sink, { side: "server", subject: row.subject, step: "applied", id: row.id, attempt })
       settle(row.subject, row.id, null)
     } catch (error) {
@@ -284,9 +281,10 @@ async function handlePut(req, res, storage, log) {
   trace(log, { side: "server", step: "put" })
   try {
     const written = await writeHashed(req, tempPath)
-    storage.commitBlob(written.hash, tempPath, written.size)
-    trace(log, { side: "server", step: "put", status: "succeed", detail: { sha256: written.hash, size: written.size } })
-    sendJson(res, 200, { sha256: written.hash, size: written.size })
+    const upload = randomId()
+    storage.commitBlob(upload, tempPath)
+    trace(log, { side: "server", step: "put", status: "succeed", detail: { upload, sha256: written.hash, size: written.size } })
+    sendJson(res, 200, { upload, sha256: written.hash, size: written.size })
   } catch (error) {
     storage.discardBlob(tempPath)
     if (res.headersSent || res.writableEnded) return
@@ -399,7 +397,7 @@ function acceptChange(storage, subject, change, clientId, base) {
   if (storage.hasEntry(subject, change.id)) return { id: change.id, enqueued: false }
   for (const manifest of packageValue.attachments) {
     try {
-      storage.requireBlob(manifest.sha256, manifest.size)
+      storage.requireBlob(manifest.upload, manifest.size)
     } catch (error) {
       if (!isAttachmentCheck(error)) throw error
       throw attachmentFailure(error, manifest.id)
@@ -474,63 +472,44 @@ function changesOf(body) {
   return Array.isArray(body.changes) ? body.changes : []
 }
 
+// GET /sync?entry=&attachment=: one attachment of one logged change, for a receiver. It streams the
+// change's own upload while that waits to be applied, and the host's stored copy after.
 async function handleGet(req, res, storage, callbacks, currentSubject, query, log) {
-  const expected = requireSha256(query)
-  const blob = storage.openBlob(expected)
-  if (blob) {
-    res.writeHead(200, {
-      "Content-Type": "application/octet-stream",
-      "Content-Length": blob.size,
-    })
-    trace(log, { side: "server", step: "get", status: "succeed", detail: { sha256: expected, size: blob.size } })
-    await pipeline(createReadStream(blob.file), res)
+  const entryId = query.get("entry")
+  const attachmentId = query.get("attachment")
+  const subject = currentSubject === undefined ? query.get("subject") : requireSubject(await currentSubject(req))
+  const entry = entryId && subject ? storage.entryById(subject, entryId) : null
+  const manifest = entry?.package.attachments.find((item) => item.id === attachmentId)
+  // Changes logged before uploads had ids carry none: they are served from the stored copy.
+  const staged = manifest?.upload ? storage.openBlob(manifest.upload) : null
+  if (staged) {
+    trace(log, { side: "server", subject, step: "get", status: "succeed", detail: { entry: entryId, attachment: attachmentId, size: staged.size } })
+    res.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": staged.size })
+    await pipeline(createReadStream(staged.file), res)
     return
   }
-  if (currentSubject === undefined) {
-    trace(log, { side: "server", step: "get", status: "failed", detail: { sha256: expected } })
-    res.writeHead(404)
-    res.end()
-    return
-  }
-  const live = requireSubject(await currentSubject(req))
-  const registered = callbacks.get(live)
-  const manifest = storage.findAttachment(live, expected)
-  if (!registered?.readAttachment || !manifest) {
-    trace(log, { side: "server", subject: live, step: "get", status: "failed", detail: { sha256: expected } })
-    res.writeHead(404)
-    res.end()
-    return
-  }
-  let bytes
+  const readAttachment = callbacks.get(subject)?.readAttachment
+  let bytes = null
   try {
-    bytes = asBytes(await registered.readAttachment(manifest), "attachment")
+    if (manifest && readAttachment) bytes = asBytes(await readAttachment(manifest), "attachment")
   } catch (error) {
-    if (isMissing(error)) {
-      trace(log, { side: "server", subject: live, step: "get", status: "failed", error: messageOf(error), detail: { sha256: expected } })
-      res.writeHead(404)
-      res.end()
-      return
-    }
-    throw error
+    if (!isMissing(error)) throw error
+  }
+  if (!bytes) {
+    trace(log, { side: "server", subject, step: "get", status: "failed", detail: { entry: entryId, attachment: attachmentId } })
+    res.writeHead(404)
+    res.end()
+    return
   }
   const actualHash = sha256(bytes)
-  if (actualHash !== manifest.sha256) {
+  if (actualHash !== manifest.sha256 || bytes.byteLength !== manifest.size) {
     throw attachmentError(
       "ATTACHMENT_HASH_MISMATCH",
-      `ATTACHMENT_HASH_MISMATCH sha256 ${manifest.sha256} actual ${actualHash} attachment ${manifest.id}`,
+      `ATTACHMENT_HASH_MISMATCH sha256 ${manifest.sha256} actual ${actualHash} size ${bytes.byteLength} attachment ${manifest.id}`,
     )
   }
-  if (bytes.byteLength !== manifest.size) {
-    throw attachmentError(
-      "ATTACHMENT_SIZE_MISMATCH",
-      `ATTACHMENT_SIZE_MISMATCH sha256 ${manifest.sha256} expected ${manifest.size} actual ${bytes.byteLength} attachment ${manifest.id}`,
-    )
-  }
-  trace(log, { side: "server", subject: live, step: "get", status: "succeed", detail: { sha256: expected, size: bytes.byteLength } })
-  res.writeHead(200, {
-    "Content-Type": "application/octet-stream",
-    "Content-Length": bytes.byteLength,
-  })
+  trace(log, { side: "server", subject, step: "get", status: "succeed", detail: { entry: entryId, attachment: attachmentId, size: bytes.byteLength } })
+  res.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": bytes.byteLength })
   res.end(Buffer.from(bytes))
 }
 
@@ -622,14 +601,6 @@ function messageOf(error) {
   return error instanceof Error && error.message ? error.message : "request failed"
 }
 
-function requireSha256(query) {
-  const value = query.get("sha256")
-  if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) {
-    throw new TypeError("sha256 is invalid")
-  }
-  return value
-}
-
 async function readJson(req) {
   const chunks = []
   let size = 0
@@ -667,5 +638,5 @@ function writeAckError(res, error) {
 }
 
 function readerFor(storage, manifests) {
-  return createAttachmentReader(manifests, async (manifest) => storage.readBlob(manifest.sha256))
+  return createAttachmentReader(manifests, async (manifest) => storage.readBlob(manifest.upload), sha256)
 }

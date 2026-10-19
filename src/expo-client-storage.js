@@ -119,63 +119,18 @@ export function createExpoClientStorage(dataDir, { sha256, subjectDigest, random
       }
     },
 
-    async putBlob(digest, expectedHash, bytes) {
+    // A received attachment, checked against its hash and saved under `name` (its change's own).
+    async putBlob(digest, name, expectedHash, bytes) {
       if (await sha256(bytes) !== expectedHash) throw new Error("attachment hash mismatch")
-      const destination = blobPath(digest, expectedHash)
-      const existing = new File(destination)
-      if (existing.exists) {
-        const saved = await existing.bytes()
-        if (await sha256(saved) !== expectedHash || saved.length !== bytes.length) {
-          throw new Error("attachment cache mismatch")
-        }
-        return
-      }
-      await writeAtomic(destination, bytes)
+      await writeAtomic(blobPath(digest, name), bytes)
     },
 
-    blobFile(digest, expectedHash) {
-      return blobPath(digest, expectedHash)
+    async readBlob(digest, name) {
+      return new File(blobPath(digest, name)).bytes()
     },
 
-    async hasBlob(digest, expectedHash) {
-      return new File(blobPath(digest, expectedHash)).exists
-    },
-
-    beginDownload(digest) {
-      const path = `${attachmentsDirectory(digest)}/.${randomId()}.download`
-      const temporary = new File(path)
-      temporary.create({ intermediates: true, overwrite: true })
-      return path
-    },
-
-    async commitDownload(digest, expectedHash, temporaryPath) {
-      const temporary = new File(temporaryPath)
-      const bytes = await temporary.bytes()
-      if (await sha256(bytes) !== expectedHash) {
-        temporary.delete()
-        throw new Error("attachment hash mismatch")
-      }
-      const destination = new File(blobPath(digest, expectedHash))
-      if (destination.exists) {
-        const saved = await destination.bytes()
-        if (saved.length !== bytes.length) throw new Error("attachment cache mismatch")
-        temporary.delete()
-        return
-      }
-      temporary.move(destination)
-    },
-
-    async discardDownload(path) {
-      const file = new File(path)
-      if (file.exists) file.delete()
-    },
-
-    async readBlob(digest, expectedHash) {
-      return new File(blobPath(digest, expectedHash)).bytes()
-    },
-
-    async dropBlob(digest, expectedHash) {
-      const file = new File(blobPath(digest, expectedHash))
+    async dropBlob(digest, name) {
+      const file = new File(blobPath(digest, name))
       if (file.exists) file.delete()
     },
 
@@ -269,7 +224,10 @@ export function createExpoClientStorage(dataDir, { sha256, subjectDigest, random
   }
   function unprocessedPath(digest) { return `${subjectDirectory(digest)}/unprocessed.json` }
   function failuresPath(digest) { return `${subjectDirectory(digest)}/failures.json` }
-  function blobPath(digest, hash) { return `${attachmentsDirectory(digest)}/${hash}` }
+  function blobPath(digest, name) {
+    if (!/^[A-Za-z0-9-]+\.[0-9]+$/.test(name)) throw new TypeError("attachment name is invalid")
+    return `${attachmentsDirectory(digest)}/${name}`
+  }
 
   async function readJsonArray(path) {
     const file = new File(path)

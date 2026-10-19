@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto"
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { sha256, subjectDigest } from "./contracts.js"
-import { hashFile } from "./hash-stream.js"
 
 export function createNodeClientStorage(dataDir) {
   return {
@@ -132,72 +131,22 @@ export function createNodeClientStorage(dataDir) {
       }
     },
 
-    async putBlob(digest, expectedHash, bytes) {
-      const actual = sha256(bytes)
-      if (actual !== expectedHash) throw new Error("attachment hash mismatch")
-      const destination = blobPath(dataDir, digest, expectedHash)
-      try {
-        const existing = await readFile(destination)
-        if (sha256(existing) !== expectedHash || existing.length !== bytes.length) {
-          throw new Error("attachment cache mismatch")
-        }
-        return
-      } catch (error) {
-        if (error.code !== "ENOENT") throw error
-      }
-      const temporary = path.join(path.dirname(destination), `.${expectedHash}.${randomUUID()}.tmp`)
+    // A received attachment, checked against its hash and saved under `name` (its change's own).
+    async putBlob(digest, name, expectedHash, bytes) {
+      if (sha256(bytes) !== expectedHash) throw new Error("attachment hash mismatch")
+      const destination = blobPath(dataDir, digest, name)
+      const temporary = `${destination}.${randomUUID()}.tmp`
       await mkdir(path.dirname(destination), { recursive: true })
       await writeFile(temporary, bytes)
       await rename(temporary, destination)
     },
 
-    blobFile(digest, expectedHash) {
-      return blobPath(dataDir, digest, expectedHash)
+    async readBlob(digest, name) {
+      return readFile(blobPath(dataDir, digest, name))
     },
 
-    async hasBlob(digest, expectedHash) {
-      try {
-        await stat(blobPath(dataDir, digest, expectedHash))
-        return true
-      } catch (error) {
-        if (error.code === "ENOENT") return false
-        throw error
-      }
-    },
-
-    beginDownload(digest) {
-      return path.join(subjectDirectory(dataDir, digest), "attachments", `.${randomUUID()}.download`)
-    },
-
-    async commitDownload(digest, expectedHash, tempPath) {
-      const temp = await stat(tempPath)
-      const actual = await hashFile(tempPath)
-      if (actual !== expectedHash) {
-        await rm(tempPath, { force: true })
-        throw new Error("attachment hash mismatch")
-      }
-      const destination = blobPath(dataDir, digest, expectedHash)
-      try {
-        const existing = await stat(destination)
-        if (existing.size !== temp.size) throw new Error("attachment cache mismatch")
-        await rm(tempPath, { force: true })
-        return
-      } catch (error) {
-        if (error.code !== "ENOENT") throw error
-      }
-      await rename(tempPath, destination)
-    },
-
-    async discardDownload(file) {
-      await rm(file, { force: true })
-    },
-
-    async readBlob(digest, expectedHash) {
-      return readFile(blobPath(dataDir, digest, expectedHash))
-    },
-
-    async dropBlob(digest, expectedHash) {
-      await rm(blobPath(dataDir, digest, expectedHash), { force: true })
+    async dropBlob(digest, name) {
+      await rm(blobPath(dataDir, digest, name), { force: true })
     },
 
     async ensureClientId() {
@@ -335,8 +284,9 @@ async function readJsonArray(file) {
   }
 }
 
-function blobPath(dataDir, digest, expectedHash) {
-  return path.join(subjectDirectory(dataDir, digest), "attachments", expectedHash)
+function blobPath(dataDir, digest, name) {
+  if (!/^[A-Za-z0-9-]+\.[0-9]+$/.test(name)) throw new TypeError("attachment name is invalid")
+  return path.join(subjectDirectory(dataDir, digest), "attachments", name)
 }
 
 async function writeIfMissing(file, contents) {

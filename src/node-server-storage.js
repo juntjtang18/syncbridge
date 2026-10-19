@@ -64,7 +64,6 @@ export function createNodeServerStorage(dataDir) {
     WHERE f.subject = ? AND f.kind = 'apply' AND l.client_id = ?
     ORDER BY f.position
   `)
-  const selectUnprocessedUsingBlob = db.prepare("SELECT 1 FROM unprocessed WHERE package_json LIKE ? LIMIT 1")
   const selectEntry = db.prepare("SELECT package_json FROM log_entries WHERE subject = ? AND id = ?")
   const selectCounter = db.prepare("SELECT next_position FROM subject_counters WHERE subject = ?")
   const insertCounter = db.prepare("INSERT INTO subject_counters (subject, next_position) VALUES (?, ?)")
@@ -88,12 +87,6 @@ export function createNodeServerStorage(dataDir) {
   const selectOrigin = db.prepare("SELECT client_id, base_position FROM log_entries WHERE subject = ? AND id = ?")
   const selectTip = db.prepare("SELECT MAX(position) AS position FROM log_entries WHERE subject = ?")
   const deleteEntry = db.prepare("DELETE FROM log_entries WHERE subject = ? AND id = ? AND position = ?")
-  const selectPackages = db.prepare(`
-    SELECT package_json
-    FROM log_entries
-    WHERE subject = ?
-    ORDER BY position DESC
-  `)
   const selectEntryById = db.prepare(`
     SELECT id, position, package_json
     FROM log_entries
@@ -173,8 +166,10 @@ export function createNodeServerStorage(dataDir) {
     updateCounter.run(position, subject)
   })
 
-  function blobFile(expectedHash) {
-    return path.join(dataDir, "blobs", requireHash(expectedHash))
+  // One file per upload, named by its upload id: no two changes share one, so each is deleted
+  // once its own change is applied.
+  function blobFile(upload) {
+    return path.join(dataDir, "blobs", requireUpload(upload))
   }
 
   return {
@@ -201,15 +196,6 @@ export function createNodeServerStorage(dataDir) {
       return selectAfter.all(subject, pointer).map(logRow)
     },
 
-    findAttachment(subject, hash) {
-      requireHash(hash)
-      for (const row of selectPackages.all(subject)) {
-        const packageValue = JSON.parse(row.package_json)
-        const manifest = (packageValue.attachments || []).find((item) => item && item.sha256 === hash)
-        if (manifest) return manifest
-      }
-      return null
-    },
 
     updateAttachmentPaths(subject, id, updates) {
       if (!Array.isArray(updates) || updates.length === 0) return
@@ -348,40 +334,27 @@ export function createNodeServerStorage(dataDir) {
       rmSync(file, { force: true })
     },
 
-    commitBlob(expectedHash, tempPath, size) {
-      const temp = statSync(tempPath)
-      if (temp.size !== size) throw new Error("attachment hash mismatch")
-      const destination = blobFile(expectedHash)
+    commitBlob(upload, tempPath) {
+      const destination = blobFile(upload)
       mkdirSync(path.dirname(destination), { recursive: true })
-      if (existsSync(destination)) {
-        const existing = statSync(destination)
-        rmSync(tempPath, { force: true })
-        if (existing.size !== size) throw new Error("attachment cache mismatch")
-        return
-      }
       renameSync(tempPath, destination)
     },
 
-    requireBlob(expectedHash, size) {
-      const hash = requireHash(expectedHash)
-      const file = blobFile(hash)
+    requireBlob(upload, size) {
       let info
       try {
-        info = statSync(file)
+        info = statSync(blobFile(upload))
       } catch (error) {
-        if (error.code === "ENOENT") throw attachmentError("ATTACHMENT_NOT_FOUND", `ATTACHMENT_NOT_FOUND sha256 ${hash}`)
+        if (error.code === "ENOENT") throw attachmentError("ATTACHMENT_NOT_FOUND", `ATTACHMENT_NOT_FOUND upload ${upload}`)
         throw error
       }
       if (info.size !== size) {
-        throw attachmentError(
-          "ATTACHMENT_SIZE_MISMATCH",
-          `ATTACHMENT_SIZE_MISMATCH sha256 ${hash} expected ${size} actual ${info.size}`,
-        )
+        throw attachmentError("ATTACHMENT_SIZE_MISMATCH", `ATTACHMENT_SIZE_MISMATCH upload ${upload} expected ${size} actual ${info.size}`)
       }
     },
 
-    openBlob(expectedHash) {
-      const file = blobFile(expectedHash)
+    openBlob(upload) {
+      const file = blobFile(upload)
       try {
         return { file, size: statSync(file).size }
       } catch (error) {
@@ -390,17 +363,14 @@ export function createNodeServerStorage(dataDir) {
       }
     },
 
-    readBlob(expectedHash) {
-      return readFileSync(blobFile(expectedHash))
+    readBlob(upload) {
+      return readFileSync(blobFile(upload))
     },
 
-    dropBlob(expectedHash) {
-      rmSync(blobFile(expectedHash), { force: true })
+    dropBlob(upload) {
+      rmSync(blobFile(upload), { force: true })
     },
 
-    unprocessedUsesBlob(expectedHash) {
-      return Boolean(selectUnprocessedUsingBlob.get(`%"sha256":"${requireHash(expectedHash)}"%`))
-    },
 
     close() {
       db.close()
@@ -408,9 +378,9 @@ export function createNodeServerStorage(dataDir) {
   }
 }
 
-function requireHash(hash) {
-  if (!/^[0-9a-f]{64}$/.test(hash)) throw new TypeError("sha256 is invalid")
-  return hash
+function requireUpload(upload) {
+  if (typeof upload !== "string" || !/^[0-9a-f-]{16,64}$/.test(upload)) throw new TypeError("upload is invalid")
+  return upload
 }
 
 function attachmentError(code, message) {
