@@ -164,6 +164,12 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
   }
 
   return {
+    // Subjects with changes still waiting to be applied, so a host that restarted can init them
+    // and let their applies resume without waiting for a request.
+    pendingSubjects() {
+      return storage.pendingSubjects()
+    },
+
     init(subject, applyChange, options) {
       const key = requireSubject(subject)
       requireApplyChange(applyChange)

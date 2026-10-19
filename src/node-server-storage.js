@@ -121,6 +121,7 @@ export function createNodeServerStorage(dataDir) {
     LIMIT 1
   `)
   const selectUnprocessedCount = db.prepare("SELECT COUNT(*) AS count FROM unprocessed")
+  const selectPendingSubjects = db.prepare("SELECT DISTINCT subject FROM unprocessed ORDER BY subject")
   const selectHeadRows = db.prepare(`
     SELECT subject, position, id, package_json, attempts
     FROM unprocessed
@@ -277,6 +278,10 @@ export function createNodeServerStorage(dataDir) {
 
     unprocessedCount(subject) {
       return countUnprocessed.get(subject).n
+    },
+
+    pendingSubjects() {
+      return selectPendingSubjects.all().map((row) => row.subject)
     },
 
     // The oldest unprocessed rows, in queue order, for the apply scheduler to choose from.

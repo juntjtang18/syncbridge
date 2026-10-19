@@ -62,3 +62,23 @@ test("a change without a key waits for everything before it and runs alone", asy
   assert.ok(at("start delete-location") > at("end p1") && at("start delete-location") > at("end p2"))
   assert.ok(at("start p3") > at("end delete-location"))
 })
+
+test("a restarted server names the subjects whose changes are still waiting", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "syncbridge-pending-"))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const dataDir = path.join(root, "server")
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  const first = createSyncServer({ dataDir, currentSubject() { return subject } })
+  const endpoints = await listen(first, t)
+  first.init(subject, async () => { await gate })
+  const client = createSyncClient({ dataDir: path.join(root, "client"), url: endpoints.url })
+  await client.use(subject, async () => {})
+  await client.appendChanges({ data: "waiting" })
+  await client.sync()
+  assert.deepEqual(first.pendingSubjects(), [subject])
+  release()
+  await first.whenIdle()
+  assert.deepEqual(first.pendingSubjects(), [])
+  await first.close()
+})
