@@ -264,3 +264,28 @@ test("a phone sends its whole queue before it receives, and downloads a few atta
   assert.equal(most, 4)
   assert.deepEqual(b.applied.map((item) => item.data), [...Array.from({ length: 12 }, (_, index) => `a${index}`), "b0", "b1", "b2"])
 })
+
+test("a server briefly unavailable while receiving ends the sync without giving up any change", async (t) => {
+  const root = await tempDir(t)
+  const files = hostFiles({ "a.jpg": "photo-a" })
+  const { server, url } = await startServer(t, root)
+  const a = await startClient(root, "a", url, files)
+  await a.client.appendChanges(photo("one", "a.jpg"))
+  await a.client.sync()
+  await server.whenIdle()
+  let restarting = true
+  const proxy = (real) => ({ ...real, get: (...args) => (restarting ? Promise.reject(Object.assign(new Error("503 Service Unavailable"), { status: 503, offline: true })) : real.get(...args)) })
+  const b = await startClient(root, "b", url, files, { wrap: proxy })
+  await assert.rejects(b.client.sync(), /503/)
+  assert.deepEqual(await b.client.failedEntries(), [])
+  restarting = false
+  await b.client.sync()
+  assert.deepEqual(b.applied, [{ data: "one", own: false, bytes: ["photo-a"] }])
+})
+
+test("the transport marks a 5xx answer offline and a 404 not", async () => {
+  const answer = (status) => async () => ({ ok: false, status, text: async () => "{\"error\":\"x\"}" })
+  const { createFetchTransport } = await import("../src/fetch-transport.js")
+  await assert.rejects(createFetchTransport({ url: "http://x/sync", fetch: answer(503) }).post({}), (error) => error.offline === true && error.status === 503)
+  await assert.rejects(createFetchTransport({ url: "http://x/sync", fetch: answer(404) }).post({}), (error) => error.offline === false && error.status === 404)
+})

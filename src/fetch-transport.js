@@ -1,5 +1,6 @@
 // The client's HTTP calls, over fetch (Node 22 and Expo both have it). A non-2xx answer throws an
-// error carrying `status`; a request that never got an answer throws one marked `offline`.
+// error carrying `status`. A request that got no answer, or a 5xx (the server restarting or busy),
+// throws one marked `offline`: the sync stops and resumes next time, using none of a change's tries.
 export function createFetchTransport({ url, headers, fetch: fetchImpl }) {
   const request = fetchImpl ?? globalThis.fetch.bind(globalThis)
 
@@ -11,7 +12,7 @@ export function createFetchTransport({ url, headers, fetch: fetchImpl }) {
     const text = await response.text().catch(() => "")
     let message = text || `HTTP ${response.status}`
     try { message = JSON.parse(text).error || message } catch { /* not JSON */ }
-    throw Object.assign(new Error(message), { status: response.status })
+    throw Object.assign(new Error(message), { status: response.status, offline: response.status >= 500 })
   }
 
   return {

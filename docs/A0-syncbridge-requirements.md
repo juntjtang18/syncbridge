@@ -41,8 +41,8 @@ log, in the same order. Applications apply each change; the last one logged wins
 10. One rule for failures: an item is tried up to 3 times back to back. A change the server refuses
     is resent (its attachments uploaded afresh) up to 3 times; an entry that does not download intact
     or apply is retried 3 times. After the third failure it goes on `failures.json` and the sync moves
-    on (for an entry, the pointer still moves past it). A network failure is not a try: `sync()`
-    throws and the next sync resumes where it stopped.
+    on (for an entry, the pointer still moves past it). A network failure, or a 5xx answer (the server restarting
+    or busy), is not a try: `sync()` throws and the next sync resumes where it stopped.
 11. `onProgress` reports `{ sent, uploaded, toSend, received, toReceive }`.
 
 ## 3. Server
