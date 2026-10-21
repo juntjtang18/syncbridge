@@ -210,10 +210,13 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
 
     // A change made by the host itself, logged for every client. With `apply` it also goes through
     // the host's applyChange, in log order with the clients' changes, and resolves once applied.
+    // Its attachments ({ id, path }) are the host's stored copies, read through readAttachment when
+    // a client downloads them. They carry no hash: the copy at `path` is current, so a client behind
+    // by a version gets the newer bytes, which is what the last change logged leaves anyway.
     async appendChanges(subject, input, { apply = false } = {}) {
       requireSubject(subject)
       const id = randomId()
-      const packageValue = { data: input.data, attachments: [] }
+      const packageValue = { data: input.data, attachments: (input.attachments || []).map(storedCopy) }
       const stored = storage.appendEntry(subject, id, packageValue, null)
       if (!apply) return { id, position: stored.position }
       const applied = new Promise((resolve, reject) => waiting.set(`${subject}\n${id}`, { resolve, reject }))
@@ -235,6 +238,11 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
       storage.close()
     },
   }
+}
+
+function storedCopy(manifest) {
+  if (typeof manifest?.id !== "string" || typeof manifest.path !== "string") throw new TypeError("attachment is invalid")
+  return { id: manifest.id, path: manifest.path, ...(manifest.contentType ? { contentType: manifest.contentType } : {}) }
 }
 
 async function readJson(req) {

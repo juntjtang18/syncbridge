@@ -195,6 +195,23 @@ test("a host change with apply resolves once applied; without apply it is only l
   assert.deepEqual(server.entriesBetween(subject, 0, 99).map((entry) => entry.package.data), ["web edit", "backfill"])
 })
 
+test("a host change's attachment is its stored copy: every phone downloads the bytes current at its path", async (t) => {
+  const root = await tempDir(t)
+  const { server, url, host } = await startServer(t, root)
+  host.files.set("p1/v1/report.pdf", Buffer.from("report-1"))
+  await server.appendChanges(subject, { data: "report 1", attachments: [{ id: "report.pdf", path: "p1/v1/report.pdf" }] })
+  const a = await startClient(root, "a", url, hostFiles())
+  await a.client.sync()
+  assert.deepEqual(a.applied, [{ data: "report 1", own: false, bytes: ["report-1"] }])
+  host.files.set("p1/v1/report.pdf", Buffer.from("report-2, longer"))
+  await server.appendChanges(subject, { data: "report 2", attachments: [{ id: "report.pdf", path: "p1/v1/report.pdf" }] })
+  // A phone behind by a version gets the current copy for both changes, and nothing fails.
+  const b = await startClient(root, "b", url, hostFiles())
+  await b.client.sync()
+  assert.deepEqual(b.applied.map((entry) => entry.bytes), [["report-2, longer"], ["report-2, longer"]])
+  assert.deepEqual(await b.client.failedEntries(), [])
+})
+
 test("a change logged before uploads had ids is served from the host's stored copy", async (t) => {
   const root = await tempDir(t)
   const { server, url, host } = await startServer(t, root)

@@ -77,8 +77,10 @@ log, in the same order. Applications apply each change; the last one logged wins
     side by side, no key alone (it waits for that subject's changes before it). An apply is tried 3 times; after the third
     failure it goes on the server's failure list. Either way its uploads are deleted. `applyChange`
     may return `{ attachments: [{ id, path }] }` to point later downloads at the stored copy.
-16. `appendChanges(subject, { data })` logs a host change for every client. With `{ apply: true }`
-    it is also applied, in log order with the clients' changes, and resolves once applied.
+16. `appendChanges(subject, { data, attachments? })` logs a host change for every client. Its
+    attachments are `{ id, path }` stored copies, served through `readAttachment` with no hash: the
+    copy at `path` is current. With `{ apply: true }` it carries no attachments and is also applied,
+    in log order with the clients' changes, and resolves once applied.
 17. A subject not initialized yet keeps its changes waiting; `pendingSubjects()` names them so a
     restarted host can `init` them.
 

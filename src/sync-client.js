@@ -59,12 +59,13 @@ export function createClient({ storage, transport, sha256, randomId, log, sendBa
     await storage.remove(name)
   }
 
-  // An entry's attachments, each checked against its hash.
+  // An entry's attachments, each checked against its hash. A host's own change logs none: its
+  // stored copy is current.
   async function download(entry) {
     const files = new Map()
     for (const manifest of entry.package.attachments) {
       const bytes = await transport.get(subject, entry.id, manifest.id)
-      if (await sha256(bytes) !== manifest.sha256 || bytes.byteLength !== manifest.size) throw new Error(`attachment ${manifest.id} arrived changed`)
+      if (manifest.sha256 && (await sha256(bytes) !== manifest.sha256 || bytes.byteLength !== manifest.size)) throw new Error(`attachment ${manifest.id} arrived changed`)
       files.set(manifest.id, bytes)
     }
     return files

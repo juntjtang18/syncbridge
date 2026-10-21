@@ -322,3 +322,5 @@ await syncServer.appendChanges(subject, {
   attachments: [],
 })
 ```
+
+An attachment on a host change is `{ id, path }`: the host's stored copy, which a client downloads through `readAttachment(manifest)`. It carries no hash, because the copy at `path` is current. A client one version behind gets the newer bytes for both changes, which is what the last change logged leaves anyway. With `{ apply: true }` a host change carries no attachments.
