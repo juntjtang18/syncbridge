@@ -102,7 +102,7 @@ http.createServer((req, res) => {
 }).listen(port)
 ```
 
-The ack is sent after the log row and the attachment temp are saved. A worker then calls `applyChange`. Throw from that callback when the business write fails. The worker tries three times, then records `apply failed after 3 attempts: …` and continues. `await syncServer.whenIdle()` waits until that queue is empty. `syncServer.failedEntries(subject)` lists send and apply failures for that subject.
+The ack is sent after the log row and the attachment temp are saved. A worker then calls `applyChange`. Throw from that callback when the business write fails. The worker tries three times, then records `apply failed after 3 attempts: …` and continues. `await syncServer.whenIdle(subject)` waits until that subject's queue is empty; another subject's backlog never holds it up. `whenIdle()` with no subject waits for every queue. `syncServer.failedEntries(subject)` lists send and apply failures for that subject.
 
 2. On the phone, create one client for the signed-in user. `dataDir` is a directory that survives app restarts, such as a folder under the app document directory. `url` is the full endpoint, including `/sync`. `headers` sends the host session on every request.
 

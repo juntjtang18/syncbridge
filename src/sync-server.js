@@ -41,10 +41,12 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
     if (mine.size === 0) running.delete(subject)
   }
 
-  // Resolves once no apply is in flight: each one that ends may have started the next.
-  async function idle() {
+  // Resolves once no apply is in flight, for one subject or for all: each one that ends may have
+  // started the next.
+  async function idle(subject) {
     for (;;) {
-      const all = [...running.values()].flatMap((mine) => [...mine.values()].map((item) => item.done))
+      const groups = subject === undefined ? [...running.values()] : [running.get(subject) ?? new Map()]
+      const all = groups.flatMap((mine) => [...mine.values()].map((item) => item.done))
       if (all.length === 0) return
       await Promise.allSettled(all)
     }
@@ -230,7 +232,8 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
     failedEntries: (subject) => storage.failedEntries(subject),
     // Subjects with changes still waiting, so a restarted host can init them and let them apply.
     pendingSubjects: () => storage.pendingSubjects(),
-    whenIdle: () => idle(),
+    // With a subject, waits for that subject's applies only: another's backlog never holds it up.
+    whenIdle: (subject) => idle(subject),
 
     async close() {
       stopped = true

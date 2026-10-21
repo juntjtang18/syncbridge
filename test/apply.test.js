@@ -95,6 +95,25 @@ test("one user's backlog does not hold up another user's changes", async (t) => 
   assert.deepEqual(done.filter((item) => item.startsWith("user.4")), Array.from({ length: 10 }, (_, index) => `user.4:${index}`))
 })
 
+test("waiting for one user's applies does not wait for another user's", async (t) => {
+  const root = await tempDir(t)
+  const server = createSyncServer({ dataDir: path.join(root, "idle-per-user") })
+  t.after(() => server.close())
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  const done = []
+  server.init("user.4", async () => { await gate; done.push("user.4") })
+  server.init("user.5", async () => { await new Promise((resolve) => setTimeout(resolve, 10)); done.push("user.5") })
+  const stuck = server.appendChanges("user.4", { data: "big upload" }, { apply: true })
+  const quick = server.appendChanges("user.5", { data: "report visit" }, { apply: true })
+  await server.whenIdle("user.5")
+  assert.deepEqual(done, ["user.5"])
+  release()
+  await Promise.all([stuck, quick])
+  await server.whenIdle()
+  assert.deepEqual(done.sort(), ["user.4", "user.5"])
+})
+
 test("a finished apply looks only at its own subject's waiting changes, however many subjects wait", async (t) => {
   const root = await tempDir(t)
   const storage = createNodeServerStorage(path.join(root, "many-users"))

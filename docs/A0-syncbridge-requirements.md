@@ -52,7 +52,7 @@ log, in the same order. Applications apply each change; the last one logged wins
 12. `createSyncServer({ dataDir, currentSubject?, log?, applyConcurrency?, maxRequests?, busyRetryAfter? })` from `syncbridge/node`.
     API: `init(subject, applyChange, { readAttachment, applyKey? })`, `handle(req, res)`,
     `appendChanges(subject, { data }, { apply? })`, `entriesBetween(subject, after, before)`,
-    `failedEntries(subject)`, `pendingSubjects()`, `whenIdle()`, `close()`.
+    `failedEntries(subject)`, `pendingSubjects()`, `whenIdle(subject?)`, `close()`.
 13. State under `dataDir`: `syncbridge.sqlite` (the logs, the changes waiting to be applied, given-up
     applies) and `uploads/<upload>` (one file per `PUT`, until its change is applied).
 14. HTTP on one path:
