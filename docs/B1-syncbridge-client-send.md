@@ -14,7 +14,10 @@ A send pass:
 1. Read the oldest 20 files.
 2. For each change, for each attachment without an `upload`: read the bytes through `readAttachment`,
    hash them, `PUT` them, check the answer's hash and size, and write `upload`, `sha256`, `size` into
-   that change's file before the next upload.
+   that change's file before the next upload. A file larger than a part (1 MB) goes up in parts:
+   the change's file notes the upload id the client chose and each part sent, so a stop sends only
+   the parts not yet up; then the server joins them. Parts begun for other bytes start over, and so
+   does a file the server cannot join (a part missing) or joined to other bytes.
 3. `POST` the 20, asking for no entries back (`page: 0`): a phone sends its whole queue first, so the
    server gets new data as fast as the phone can upload. Delete each accepted file.
 4. If the server named a refused change, add one to its `attempts` and clear its uploads, so the next

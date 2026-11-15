@@ -1,7 +1,23 @@
 import { createHash } from "node:crypto"
-import { createWriteStream } from "node:fs"
+import { createReadStream, createWriteStream } from "node:fs"
 import { Transform } from "node:stream"
 import { pipeline } from "node:stream/promises"
+
+// The files read one after another, as one stream.
+export async function* filesInTurn(files) {
+  for (const file of files) yield* createReadStream(file)
+}
+
+// The hash and size of a stream's bytes.
+export async function hashOf(source) {
+  const hash = createHash("sha256")
+  let size = 0
+  for await (const chunk of source) {
+    hash.update(chunk)
+    size += chunk.length
+  }
+  return { hash: hash.digest("hex"), size }
+}
 
 // Streams an upload to `file`, hashing it on the way.
 export async function writeHashed(source, file) {

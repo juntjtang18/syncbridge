@@ -50,7 +50,7 @@ export async function startServer(t, root, { apply, applyConcurrency, applyKey, 
 }
 
 // A client whose transport can be wrapped (to count, delay or fail calls).
-export async function startClient(root, name, url, files, { wrap = (transport) => transport, sendBatch, receivePage } = {}) {
+export async function startClient(root, name, url, files, { wrap = (transport) => transport, sendBatch, receivePage, partSize, partsAtOnce } = {}) {
   const applied = []
   const client = createClient({
     storage: createClientStorage(nodeFs, path.join(root, name), randomId),
@@ -59,6 +59,8 @@ export async function startClient(root, name, url, files, { wrap = (transport) =
     randomId,
     ...(sendBatch ? { sendBatch } : {}),
     ...(receivePage ? { receivePage } : {}),
+    ...(partSize ? { partSize } : {}),
+    ...(partsAtOnce ? { partsAtOnce } : {}),
   })
   await client.init(subject, async (entry, attachments) => {
     const bytes = await Promise.all(entry.package.attachments.map(async (manifest) => Buffer.from(await attachments.get(manifest.id).read()).toString()))

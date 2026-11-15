@@ -7,7 +7,7 @@ import { createLog, trace } from "./log.js"
 // every logged change after this install's pointer, in log order, moving the pointer as it goes.
 // A change that fails three times (refused by the server, or not applied here) goes on the failure
 // list and the sync moves on. A network failure ends the sync; the next one resumes where it stopped.
-export function createClient({ storage, transport, sha256, randomId, log, sendBatch = SYNC_LIMITS.sendBatch, receivePage = SYNC_LIMITS.receivePage, downloads = SYNC_LIMITS.downloads }) {
+export function createClient({ storage, transport, sha256, randomId, log, sendBatch = SYNC_LIMITS.sendBatch, receivePage = SYNC_LIMITS.receivePage, downloads = SYNC_LIMITS.downloads, partSize = SYNC_LIMITS.partSize, partsAtOnce = SYNC_LIMITS.partsAtOnce }) {
   const sink = createLog(log)
   const listeners = new Set()
   let progress = { sent: 0, uploaded: 0, toSend: 0, received: 0, toReceive: 0 }
@@ -33,17 +33,37 @@ export function createClient({ storage, transport, sha256, randomId, log, sendBa
 
   // Uploads the change's attachments not yet up, checks the server received the same bytes, and
   // keeps the upload ids on its outbox file, so a stop part way re-uploads nothing already sent.
+  // A file larger than a part goes up in parts.
   async function upload({ name, row }) {
     for (const manifest of row.package.attachments.filter((item) => !item.upload)) {
       const bytes = await readAttachment(manifest)
       const hash = await sha256(bytes)
-      const put = await transport.put(bytes)
-      if (put.sha256 !== hash || put.size !== bytes.byteLength) throw new Error(`attachment ${manifest.id} arrived changed`)
-      Object.assign(manifest, { upload: put.upload, sha256: hash, size: bytes.byteLength })
-      trace(sink, { side: "client", subject, step: "put", id: row.id, detail: { attachmentId: manifest.id, upload: put.upload } })
+      const put = bytes.byteLength > partSize ? await sendParts(name, row, manifest, bytes, hash) : await transport.put(bytes)
+      // The parts begun go either way: a file that did not arrive whole is sent afresh next time.
+      delete manifest.parts
+      if (put?.sha256 === hash && put.size === bytes.byteLength) Object.assign(manifest, { upload: put.upload, sha256: hash, size: bytes.byteLength })
       await storage.save(name, row)
+      if (!manifest.upload) throw new Error(`attachment ${manifest.id} arrived changed`)
+      trace(sink, { side: "client", subject, step: "put", id: row.id, detail: { attachmentId: manifest.id, upload: put.upload } })
     }
     report({ uploaded: progress.uploaded + 1 })
+  }
+
+  // Sends a file's parts not yet up, `partsAtOnce` at a time, noting each on the outbox file, then
+  // asks the server to join them. Parts begun for other bytes or another part size start over. A
+  // server missing a part answers 409: null, and the file is sent afresh.
+  async function sendParts(name, row, manifest, bytes, hash) {
+    if (manifest.parts?.sha256 !== hash || manifest.parts.partSize !== partSize) manifest.parts = { upload: randomId(), sha256: hash, partSize, sent: [] }
+    const { upload, sent } = manifest.parts
+    const count = Math.ceil(bytes.byteLength / partSize)
+    const todo = Array.from({ length: count }, (_, index) => index).filter((index) => !sent.includes(index))
+    await inTurn(todo, partsAtOnce, async (index) => {
+      await transport.putPart(upload, index, bytes.slice(index * partSize, (index + 1) * partSize))
+      sent.push(index)
+      await storage.save(name, row)
+      trace(sink, { side: "client", subject, step: "put-part", id: row.id, detail: { attachmentId: manifest.id, upload, index, of: count } })
+    })
+    return transport.join(upload, count).catch((error) => (error.status === 409 ? null : Promise.reject(error)))
   }
 
   // The server refused a change: try it again (its attachments uploaded afresh) up to three times.
@@ -143,6 +163,19 @@ export function createClient({ storage, transport, sha256, randomId, log, sendBa
       return () => { listeners.delete(listener) }
     },
   }
+}
+
+// Runs work(item) for each item in order, at most `limit` at a time. After a failure no new item
+// starts; it throws the first failure once the running ones end.
+async function inTurn(items, limit, work) {
+  const queue = [...items]
+  let failed = false
+  const worker = async () => {
+    while (queue.length && !failed) await work(queue.shift()).catch((error) => { failed = true; throw error })
+  }
+  const settled = await Promise.allSettled(Array.from({ length: limit }, worker))
+  const failure = settled.find((result) => result.status === "rejected")
+  if (failure) throw failure.reason
 }
 
 // Starts work(item) for each item, at most `limit` at a time, in order. Each result is

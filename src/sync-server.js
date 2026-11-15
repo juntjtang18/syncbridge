@@ -2,7 +2,7 @@ import { createReadStream } from "node:fs"
 import { pipeline } from "node:stream/promises"
 import { asBytes, attachmentReader, loggedPackage, messageOf, requireFunction, requireSubject, tryThrice } from "./client-contracts.js"
 import { randomId } from "./contracts.js"
-import { writeHashed } from "./hash-stream.js"
+import { filesInTurn, hashOf, writeHashed } from "./hash-stream.js"
 import { SYNC_LIMITS } from "./limits.js"
 import { createLog, trace } from "./log.js"
 
@@ -108,7 +108,16 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
     storage.enqueue(subject, stored.position, change.id, packageValue)
   }
 
-  async function handlePut(req, res) {
+  // An upload: a whole file (no query), one part of a file (`upload`, `part`), or the ask to join a
+  // file's parts (`upload`, `parts`, no body). The client names an upload sent in parts.
+  async function handlePut(req, res, query) {
+    const upload = query.get("upload")
+    if (upload === null) await putWhole(req, res)
+    else if (query.has("part")) await putPart(req, res, upload, partNumber(query.get("part"), 0))
+    else await join(req, res, upload, partNumber(query.get("parts"), 1))
+  }
+
+  async function putWhole(req, res) {
     const temp = storage.uploadTemp()
     try {
       const written = await writeHashed(req, temp)
@@ -119,6 +128,43 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
     } finally {
       storage.discard(temp)
     }
+  }
+
+  async function putPart(req, res, upload, index) {
+    const temp = storage.uploadTemp()
+    try {
+      const written = await writeHashed(req, temp)
+      storage.commitPart(upload, index, temp)
+      trace(sink, { side: "server", step: "put-part", detail: { upload, index, size: written.size } })
+      sendJson(res, 200, { upload, part: index, size: written.size })
+    } finally {
+      storage.discard(temp)
+    }
+  }
+
+  // Joins parts 0 … parts-1 in order into the upload, and answers as for a whole one. Asked again
+  // (its answer lost), it answers from the joined file. A part missing is 409 with the missing list.
+  async function join(req, res, upload, parts) {
+    req.resume()
+    if (storage.uploadSize(upload) === null) {
+      const missing = storage.missingParts(upload, parts)
+      if (missing.length) {
+        trace(sink, { side: "server", step: "join-missing", detail: { upload, parts, missing: missing.length } })
+        sendJson(res, 409, { error: "parts of this upload are missing", missing })
+        return
+      }
+      const temp = storage.uploadTemp()
+      try {
+        await writeHashed(filesInTurn(storage.partPaths(upload, parts)), temp)
+        storage.commitUpload(upload, temp)
+      } finally {
+        storage.discard(temp)
+      }
+      storage.dropParts(upload)
+    }
+    const written = await hashOf(createReadStream(storage.uploadPath(upload)))
+    trace(sink, { side: "server", step: "join", detail: { upload, parts, size: written.size } })
+    sendJson(res, 200, { upload, sha256: written.hash, size: written.size })
   }
 
   async function handlePost(req, res) {
@@ -197,7 +243,7 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
       inFlight += 1
       try {
         const query = new URL(req.url || "/", "http://localhost").searchParams
-        if (req.method === "PUT") await handlePut(req, res)
+        if (req.method === "PUT") await handlePut(req, res, query)
         else if (req.method === "POST") await handlePost(req, res)
         else if (req.method === "GET") await handleGet(req, res, query)
         else sendJson(res, 405, { error: "method not allowed" })
@@ -241,6 +287,13 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
       storage.close()
     },
   }
+}
+
+// A part index (from 0) or a part count (from 1), up to maxParts.
+function partNumber(value, from) {
+  const number = Number(value)
+  if (value === null || value === "" || !Number.isInteger(number) || number < from || number > SYNC_LIMITS.maxParts) throw new TypeError("part is invalid")
+  return number
 }
 
 function storedCopy(manifest) {

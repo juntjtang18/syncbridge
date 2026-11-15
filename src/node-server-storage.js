@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto"
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs"
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs"
 import path from "node:path"
 import Database from "better-sqlite3"
 
 // The server's state under `dataDir`:
 //   syncbridge.sqlite  each subject's log, the changes waiting to be applied, and given-up applies
-//   uploads/<upload>   one file per PUT, until its change is applied
+//   uploads/<upload>   one file per upload, until its change is applied
+//   uploads/<upload>.parts/<index>  the parts of an upload sent in parts, until they are joined
 export function createNodeServerStorage(dataDir) {
   mkdirSync(dataDir, { recursive: true })
   const db = new Database(path.join(dataDir, "syncbridge.sqlite"))
@@ -118,6 +119,24 @@ export function createNodeServerStorage(dataDir) {
       }
     },
     uploadPath: (upload) => uploadFile(upload),
+    // A part is kept under its upload; sent again, it replaces the one there.
+    commitPart(upload, index, temp) {
+      mkdirSync(`${uploadFile(upload)}.parts`, { recursive: true })
+      renameSync(temp, path.join(`${uploadFile(upload)}.parts`, String(index)))
+    },
+    // Of parts 0 … count-1, the indexes not here.
+    missingParts(upload, count) {
+      let names = []
+      try {
+        names = readdirSync(`${uploadFile(upload)}.parts`)
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error
+      }
+      const have = new Set(names)
+      return Array.from({ length: count }, (_, index) => index).filter((index) => !have.has(String(index)))
+    },
+    partPaths: (upload, count) => Array.from({ length: count }, (_, index) => path.join(`${uploadFile(upload)}.parts`, String(index))),
+    dropParts: (upload) => rmSync(`${uploadFile(upload)}.parts`, { recursive: true, force: true }),
     readUpload: (upload) => new Uint8Array(readFileSync(uploadFile(upload))),
     dropUpload: (upload) => rmSync(uploadFile(upload), { force: true }),
 

@@ -30,7 +30,9 @@ log, in the same order. Applications apply each change; the last one logged wins
    - take the oldest `sendBatch` (20) outbox changes;
    - upload each attachment not yet uploaded: hash the bytes, `PUT` them, check the answer's
      `sha256` and `size`, and keep `upload`, `sha256`, `size` on the change's outbox file at once
-     (a stop re-uploads nothing already up);
+     (a stop re-uploads nothing already up). A file larger than `partSize` (1 MB) goes up in parts,
+     `partsAtOnce` (1) at a time, each noted on the outbox file as it lands, then the server joins
+     them: a stop loses one part, not the file;
    - `POST` the batch with the pointer; delete the accepted changes from the outbox;
    - while changes are left to send, ask for no entries (`page: 0`): send first, then receive;
    - apply each returned entry in order, then set the pointer to its position. Attachments are
@@ -54,9 +56,15 @@ log, in the same order. Applications apply each change; the last one logged wins
     `appendChanges(subject, { data }, { apply? })`, `entriesBetween(subject, after, before)`,
     `failedEntries(subject)`, `pendingSubjects()`, `whenIdle(subject?)`, `close()`.
 13. State under `dataDir`: `syncbridge.sqlite` (the logs, the changes waiting to be applied, given-up
-    applies) and `uploads/<upload>` (one file per `PUT`, until its change is applied).
+    applies), `uploads/<upload>` (one file per upload, until its change is applied) and
+    `uploads/<upload>.parts/<index>` (an upload's parts, until joined).
 14. HTTP on one path:
     - `PUT` bytes → `{ upload, sha256, size }`. Every upload is its own file.
+    - `PUT ?upload=&part=` bytes → `{ upload, part, size }`: one part, kept under the upload id the
+      client chose; sent again, it replaces the one there. Parts may arrive in any order.
+    - `PUT ?upload=&parts=` → joins parts `0 … parts-1` in order into `uploads/<upload>` and answers
+      `{ upload, sha256, size }`; asked again, it answers from the joined file. A missing part is
+      HTTP 409 `{ missing }`, and the client sends that file afresh.
     - `POST { subject, pointer, clientId, changes, page }` → `{ acceptedIds, refused?, entries, more, remaining }`.
       Changes are accepted in order; the first that cannot be (its upload missing or not the logged
       size, or malformed) is named in `refused: { id, error }` and the rest wait for the next post.

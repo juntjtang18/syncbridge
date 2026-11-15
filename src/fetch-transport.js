@@ -32,6 +32,22 @@ export function createFetchTransport({ url, headers, fetch: fetchImpl }) {
       return response.json()
     },
 
+    // One part of an upload sent in parts, under the upload id the client chose.
+    async putPart(upload, index, bytes) {
+      const response = await call(withQuery(url, { upload, part: index }), {
+        method: "PUT",
+        headers: { "content-type": "application/octet-stream", "content-length": String(bytes.byteLength) },
+        body: bytes,
+      })
+      return response.json()
+    },
+
+    // Asks the server to join the upload's parts: { upload, sha256, size }, as for a whole upload.
+    async join(upload, parts) {
+      const response = await call(withQuery(url, { upload, parts }), { method: "PUT", headers: { "content-length": "0" } })
+      return response.json()
+    },
+
     async post(body) {
       const response = await call(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })
       return response.json()
@@ -39,12 +55,14 @@ export function createFetchTransport({ url, headers, fetch: fetchImpl }) {
 
     // One attachment of one logged change.
     async get(subject, entry, attachment) {
-      const target = new URL(url)
-      target.searchParams.set("subject", subject)
-      target.searchParams.set("entry", entry)
-      target.searchParams.set("attachment", attachment)
-      const response = await call(target.toString(), { method: "GET", headers: {} })
+      const response = await call(withQuery(url, { subject, entry, attachment }), { method: "GET", headers: {} })
       return new Uint8Array(await response.arrayBuffer())
     },
   }
+}
+
+function withQuery(url, query) {
+  const target = new URL(url)
+  for (const [key, value] of Object.entries(query)) target.searchParams.set(key, String(value))
+  return target.toString()
 }

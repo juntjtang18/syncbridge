@@ -8,6 +8,13 @@ export const SYNC_LIMITS = {
   receivePage: 200,
   // Attachments downloaded at once while receiving; changes are still applied one by one in order.
   downloads: 4,
+  // A file larger than a part goes up in parts, so a stop loses one part, not the file: a 1 MB part
+  // takes about 45 s at a weak phone signal's 23 KB/s. Parts sent at once: more only helps a fast
+  // link with a long round trip; a slow link is shared by them all.
+  partSize: 1024 * 1024,
+  partsAtOnce: 1,
+  // The most parts the server takes for one upload (100 GB at 1 MB parts).
+  maxParts: 100_000,
   // Server applies in flight at once. An apply mostly waits on the host's storage (a Drive upload is
   // about a second), so a few at once multiply throughput on one thread. Drive allows ~3 writes/s.
   applyConcurrency: 3,
