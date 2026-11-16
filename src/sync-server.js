@@ -77,7 +77,8 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
   }
 
   async function applyRow(row) {
-    const { applyChange } = callbacks.get(row.subject)
+    const { applyChange, onApplyFailure } = callbacks.get(row.subject)
+    const original = onApplyFailure ? structuredClone(row.package) : null
     let moved = null
     const failure = await tryThrice(async () => {
       const applied = await applyChange(
@@ -88,6 +89,17 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
     })
     if (moved) storage.setAttachmentPaths(row.subject, row.id, moved)
     if (failure) storage.recordFailure(row.subject, row.position, row.id, `apply failed after 3 attempts: ${messageOf(failure)}`)
+    if (failure && onApplyFailure) {
+      try {
+        await onApplyFailure({ subject: row.subject, attempts: 3, error: failure,
+          entry: { id: row.id, position: row.position, package: original,
+            clientId: storage.entryById(row.subject, row.id)?.clientId ?? null } })
+      } catch (error) {
+        // Best effort by contract: archiving must not block subsequent synchronization.
+        trace(sink, { side: "server", subject: row.subject, step: "failure-archive-failed", id: row.id,
+          error: "failure archive callback failed" })
+      }
+    }
     for (const manifest of row.package.attachments) storage.dropUpload(manifest.upload)
     storage.dequeue(row.subject, row.id)
     trace(sink, { side: "server", subject: row.subject, step: failure ? "apply-failed" : "applied", id: row.id, error: failure ? messageOf(failure) : undefined })
@@ -228,7 +240,8 @@ export function createServer({ storage, currentSubject, log, applyConcurrency = 
       requireSubject(subject)
       requireFunction(applyChange, "applyChange")
       if (callbacks.has(subject)) throw new Error(`subject already initialized: ${subject}`)
-      callbacks.set(subject, { applyChange, readAttachment: options.readAttachment, applyKey: options.applyKey })
+      if (options.onApplyFailure !== undefined) requireFunction(options.onApplyFailure, "onApplyFailure")
+      callbacks.set(subject, { applyChange, readAttachment: options.readAttachment, applyKey: options.applyKey, onApplyFailure: options.onApplyFailure })
       schedule(subject)
     },
 

@@ -324,3 +324,16 @@ await syncServer.appendChanges(subject, {
 ```
 
 An attachment on a host change is `{ id, path }`: the host's stored copy, which a client downloads through `readAttachment(manifest)`. It carries no hash, because the copy at `path` is current. A client one version behind gets the newer bytes for both changes, which is what the last change logged leaves anyway. With `{ apply: true }` a host change carries no attachments.
+
+## Retaining failed applications (Node host)
+
+`server.init(subject, applyChange, { onApplyFailure })` accepts an optional async hook.
+It runs once after all three application attempts fail, before upload cleanup and dequeue.
+The argument is `{ subject, entry: { id, position, package, clientId }, attempts, error }`.
+`package` is a snapshot taken before application; the host can preserve the operation and
+uploaded attachments in its own recovery store. Success never calls this hook.
+
+The hook is best effort: its rejection emits `failure-archive-failed`, then normal cleanup,
+dequeue and failure reporting continue. A fulfilled hook must have durably saved anything
+it needs before returning. It does not suppress or erase the original apply failure.
+Existing hosts without the hook retain the previous behavior. No client protocol changes.
