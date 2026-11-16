@@ -1,6 +1,6 @@
 {
   "name": "syncbridge",
-  "version": "0.2.0-recovery.1",
+  "version": "0.2.1",
   "type": "module",
   "exports": {
     "./node": "./src/node.js",
